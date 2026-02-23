@@ -68,6 +68,7 @@ command | pager
 | `/` | Search forward |
 | `?` | Search backward |
 | `n` / `N` | Next / previous match |
+| Esc | Clear active search |
 | `F` | Enter follow mode |
 | `y` | Yank current line to clipboard |
 | `:` | Open command prompt |
@@ -108,8 +109,9 @@ wrap = true
 number = false
 search_regex = true
 search_wrap = true
-search_current_match_sgr = "7;93"
-search_other_match_sgr = "7"
+search_current_match_sgr = "reversed yellow"
+search_other_match_sgr = "reversed"
+command_popup_rows = 5
 sync_output = true
 
 [keybindings]
@@ -132,5 +134,9 @@ command = [":"]
 help = ["h"]
 ```
 
-`search_current_match_sgr` and `search_other_match_sgr` accept SGR parameter lists
-(for example `7;93` for reverse + bright yellow, or `7` for plain reverse).
+`search_current_match_sgr` and `search_other_match_sgr` accept either numeric SGR
+codes (for example `7;33`) or common aliases (for example `reversed yellow`,
+`reversed`, `bright-yellow`, `bg-blue`).
+
+`command_popup_rows` controls the maximum number of command suggestions shown in
+the `:` popup (default `5`, max `32`).

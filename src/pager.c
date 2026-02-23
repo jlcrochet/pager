@@ -26,7 +26,8 @@
 #define MAX_COMMAND 256
 #define SEARCH_HISTORY_SIZE 16
 #define STATUS_FLASH_MS 900
-#define COMMAND_POPUP_MAX_ROWS 5
+#define DEFAULT_COMMAND_POPUP_ROWS 5
+#define MAX_COMMAND_POPUP_ROWS 32
 #define WRAP_CONT_MARK "\xE2\x86\xAA" /* ↪ */
 #define CONFIG_PATH_MAX 4096
 #define MAX_BINDINGS_PER_ACTION 16
@@ -95,6 +96,8 @@ enum pager_action {
 };
 
 static int read_key(void);
+static bool str_eq_ci(const char *a, const char *b);
+static void render_status_bar(void);
 
 struct sgr_state {
 	char bytes[1024];
@@ -172,8 +175,9 @@ static bool show_line_numbers = false;
 static bool follow_mode = false;
 static bool search_use_regex = true;
 static bool search_wrap = true;
-static char search_current_match_sgr[MAX_SGR_SEQUENCE] = CSI "7;93m";
+static char search_current_match_sgr[MAX_SGR_SEQUENCE] = CSI "7;33m";
 static char search_other_match_sgr[MAX_SGR_SEQUENCE] = CSI "7m";
+static size_t command_popup_rows = DEFAULT_COMMAND_POPUP_ROWS;
 static bool sync_output_enabled = true;
 
 static bool running = true;
@@ -387,28 +391,129 @@ static bool parse_toml_string(const char *value, char *dst, size_t dst_size)
 	return true;
 }
 
-static bool is_valid_sgr_params(const char *s)
-{
-	if (!s || s[0] == '\0')
-		return false;
+struct sgr_alias {
+	const char *name;
+	const char *params;
+};
 
-	bool expect_digit = true;
-	for (size_t i = 0; s[i] != '\0'; i++) {
-		char ch = s[i];
-		if (isdigit((unsigned char)ch)) {
-			expect_digit = false;
-			continue;
-		}
-		if (ch == ';') {
-			if (expect_digit)
-				return false;
-			expect_digit = true;
-			continue;
-		}
+static bool sgr_token_is_number(const char *token)
+{
+	if (!token || token[0] == '\0')
 		return false;
+	for (size_t i = 0; token[i] != '\0'; i++) {
+		if (!isdigit((unsigned char)token[i]))
+			return false;
+	}
+	return true;
+}
+
+static bool is_sgr_token_delim(int ch)
+{
+	return ch == ',' || ch == ';' || ch == '+' || ch == '|'
+		|| isspace((unsigned char)ch);
+}
+
+static const char *lookup_sgr_alias(const char *token)
+{
+	static const struct sgr_alias aliases[] = {
+		{ "reset", "0" },
+		{ "bold", "1" },
+		{ "dim", "2" },
+		{ "faint", "2" },
+		{ "half-bright", "2" },
+		{ "half_bright", "2" },
+		{ "italic", "3" },
+		{ "underline", "4" },
+		{ "blink", "5" },
+		{ "reverse", "7" },
+		{ "reversed", "7" },
+		{ "inverse", "7" },
+		{ "black", "30" },
+		{ "red", "31" },
+		{ "green", "32" },
+		{ "yellow", "33" },
+		{ "brown", "33" },
+		{ "blue", "34" },
+		{ "magenta", "35" },
+		{ "cyan", "36" },
+		{ "white", "37" },
+		{ "default", "39" },
+		{ "default-fg", "39" },
+		{ "default_fg", "39" },
+		{ "bright-black", "90" },
+		{ "bright_black", "90" },
+		{ "bright-red", "91" },
+		{ "bright_red", "91" },
+		{ "bright-green", "92" },
+		{ "bright_green", "92" },
+		{ "bright-yellow", "93" },
+		{ "bright_yellow", "93" },
+		{ "bright-blue", "94" },
+		{ "bright_blue", "94" },
+		{ "bright-magenta", "95" },
+		{ "bright_magenta", "95" },
+		{ "bright-cyan", "96" },
+		{ "bright_cyan", "96" },
+		{ "bright-white", "97" },
+		{ "bright_white", "97" },
+		{ "bg-black", "40" },
+		{ "bg_black", "40" },
+		{ "bg-red", "41" },
+		{ "bg_red", "41" },
+		{ "bg-green", "42" },
+		{ "bg_green", "42" },
+		{ "bg-yellow", "43" },
+		{ "bg_yellow", "43" },
+		{ "bg-blue", "44" },
+		{ "bg_blue", "44" },
+		{ "bg-magenta", "45" },
+		{ "bg_magenta", "45" },
+		{ "bg-cyan", "46" },
+		{ "bg_cyan", "46" },
+		{ "bg-white", "47" },
+		{ "bg_white", "47" },
+		{ "bg-default", "49" },
+		{ "bg_default", "49" },
+		{ "bg-bright-black", "100" },
+		{ "bg_bright_black", "100" },
+		{ "bg-bright-red", "101" },
+		{ "bg_bright_red", "101" },
+		{ "bg-bright-green", "102" },
+		{ "bg_bright_green", "102" },
+		{ "bg-bright-yellow", "103" },
+		{ "bg_bright_yellow", "103" },
+		{ "bg-bright-blue", "104" },
+		{ "bg_bright_blue", "104" },
+		{ "bg-bright-magenta", "105" },
+		{ "bg_bright_magenta", "105" },
+		{ "bg-bright-cyan", "106" },
+		{ "bg_bright_cyan", "106" },
+		{ "bg-bright-white", "107" },
+		{ "bg_bright_white", "107" },
+	};
+
+	for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); i++) {
+		if (str_eq_ci(token, aliases[i].name))
+			return aliases[i].params;
+	}
+	return NULL;
+}
+
+static bool append_sgr_params(char *dst, size_t dst_size, size_t *dst_len, const char *params)
+{
+	size_t len = strlen(params);
+	if (*dst_len > 0) {
+		if (*dst_len + 1 >= dst_size)
+			return false;
+		dst[(*dst_len)++] = ';';
 	}
 
-	return !expect_digit;
+	if (*dst_len + len >= dst_size)
+		return false;
+	memcpy(dst + *dst_len, params, len);
+	*dst_len += len;
+	dst[*dst_len] = '\0';
+	return true;
 }
 
 static bool parse_toml_sgr(const char *value, char *dst, size_t dst_size)
@@ -419,10 +524,45 @@ static bool parse_toml_sgr(const char *value, char *dst, size_t dst_size)
 
 	char *trimmed = trim_left(params);
 	trim_right(trimmed);
-	if (!is_valid_sgr_params(trimmed))
+	if (trimmed[0] == '\0')
 		return false;
 
-	int n = snprintf(dst, dst_size, CSI "%sm", trimmed);
+	char merged[MAX_SGR_PARAMS] = "";
+	size_t merged_len = 0;
+
+	const char *cursor = trimmed;
+	while (*cursor != '\0') {
+		while (*cursor != '\0' && is_sgr_token_delim((unsigned char)*cursor))
+			cursor++;
+		if (*cursor == '\0')
+			break;
+
+		char token[MAX_SGR_PARAMS];
+		size_t token_len = 0;
+		while (cursor[token_len] != '\0' && !is_sgr_token_delim((unsigned char)cursor[token_len])) {
+			if (token_len + 1 >= sizeof(token))
+				return false;
+			token[token_len] = cursor[token_len];
+			token_len++;
+		}
+		token[token_len] = '\0';
+		cursor += token_len;
+
+		const char *mapped = NULL;
+		if (sgr_token_is_number(token))
+			mapped = token;
+		else
+			mapped = lookup_sgr_alias(token);
+		if (!mapped)
+			return false;
+		if (!append_sgr_params(merged, sizeof(merged), &merged_len, mapped))
+			return false;
+	}
+
+	if (merged_len == 0)
+		return false;
+
+	int n = snprintf(dst, dst_size, CSI "%sm", merged);
 	if (n < 0 || (size_t)n >= dst_size)
 		return false;
 
@@ -1087,7 +1227,7 @@ static void apply_config_kv(
 
 	if (strcmp(key, "search_current_match_sgr") == 0) {
 		if (!parse_toml_sgr(value, search_current_match_sgr, sizeof(search_current_match_sgr))) {
-			fprintf(stderr, "pager: %s:%zu invalid SGR params for %s (example: \"7;93\")\n",
+			fprintf(stderr, "pager: %s:%zu invalid SGR params/aliases for %s (example: \"reversed yellow\")\n",
 				path, line_no, key);
 			return;
 		}
@@ -1096,10 +1236,25 @@ static void apply_config_kv(
 
 	if (strcmp(key, "search_other_match_sgr") == 0) {
 		if (!parse_toml_sgr(value, search_other_match_sgr, sizeof(search_other_match_sgr))) {
-			fprintf(stderr, "pager: %s:%zu invalid SGR params for %s (example: \"7\")\n",
+			fprintf(stderr, "pager: %s:%zu invalid SGR params/aliases for %s (example: \"reversed\")\n",
 				path, line_no, key);
 			return;
 		}
+		return;
+	}
+
+	if (strcmp(key, "command_popup_rows") == 0) {
+		size_t n = 0;
+		if (!parse_toml_size(value, &n)) {
+			fprintf(stderr, "pager: %s:%zu invalid positive integer for %s\n", path, line_no, key);
+			return;
+		}
+		if (n > MAX_COMMAND_POPUP_ROWS) {
+			fprintf(stderr, "pager: %s:%zu %s exceeds max %d\n",
+				path, line_no, key, MAX_COMMAND_POPUP_ROWS);
+			return;
+		}
+		command_popup_rows = n;
 		return;
 	}
 
@@ -1212,8 +1367,9 @@ static bool write_generated_config(FILE *fp)
 		"# pattern = \"\"\n"
 		"# search_regex = true\n"
 		"# search_wrap = true\n"
-		"# search_current_match_sgr = \"7;93\"  # reverse + bright yellow\n"
-		"# search_other_match_sgr = \"7\"       # reverse default colors\n"
+		"# search_current_match_sgr = \"reversed yellow\"  # aliases also accepted\n"
+		"# search_other_match_sgr = \"reversed\"\n"
+		"# command_popup_rows = 5  # max 32\n"
 		"# sync_output = true\n"
 		"#\n"
 		"# Keybindings: each key can map to one action.\n"
@@ -2534,6 +2690,126 @@ static void render_line_slice(const char *line, size_t len, size_t start_col, si
 	PUTS_ERR(SGR_RESET);
 }
 
+static size_t rendered_rows_for_line(const char *line, size_t len)
+{
+	if (!wrap_mode)
+		return 1;
+
+	size_t width = display_width(line, len);
+	size_t first_cols = (size_t)content_cols;
+	if (width <= first_cols)
+		return 1;
+
+	size_t mark_width = display_width(WRAP_CONT_MARK, strlen(WRAP_CONT_MARK));
+	size_t cont_cols = first_cols > mark_width ? first_cols - mark_width : 1;
+	size_t remaining = width - first_cols;
+	return 1 + (remaining + cont_cols - 1) / cont_cols;
+}
+
+static bool view_line_screen_span(size_t target_view_idx, size_t *out_row_start, size_t *out_rows_visible)
+{
+	if (target_view_idx < scroll_line)
+		return false;
+
+	size_t row = 0;
+	size_t total = view_line_count();
+	for (size_t view_idx = scroll_line; view_idx < total && row < (size_t)content_rows; view_idx++) {
+		size_t raw_line = view_to_raw_line(view_idx);
+		size_t len = 0;
+		const char *line = get_line(raw_line, &len);
+		size_t line_rows = rendered_rows_for_line(line, len);
+
+		if (view_idx == target_view_idx) {
+			size_t visible = line_rows;
+			if (row + visible > (size_t)content_rows)
+				visible = (size_t)content_rows - row;
+			if (visible == 0)
+				return false;
+			if (out_row_start)
+				*out_row_start = row;
+			if (out_rows_visible)
+				*out_rows_visible = visible;
+			return true;
+		}
+
+		row += line_rows;
+	}
+
+	return false;
+}
+
+static void redraw_visible_view_line(size_t view_idx)
+{
+	size_t row_start = 0;
+	size_t rows_visible = 0;
+	if (!view_line_screen_span(view_idx, &row_start, &rows_visible))
+		return;
+
+	size_t raw_line = view_to_raw_line(view_idx);
+	size_t len = 0;
+	const char *line = get_line(raw_line, &len);
+
+	if (!wrap_mode) {
+		PRINTF_ERR(CUP(%zu, 1), row_start + 1);
+		draw_gutter(raw_line, false);
+		render_line_slice(line, len, scroll_col, (size_t)content_cols, raw_line);
+		PUTS_ERR(SGR_RESET ERASE_TO_EOL);
+		return;
+	}
+
+	size_t mark_width = display_width(WRAP_CONT_MARK, strlen(WRAP_CONT_MARK));
+	size_t start_col = 0;
+	size_t wrap_idx = 0;
+
+	for (size_t r = 0; r < rows_visible; r++) {
+		PRINTF_ERR(CUP(%zu, 1), row_start + r + 1);
+		draw_gutter(raw_line, wrap_idx > 0);
+
+		size_t line_cols = (size_t)content_cols;
+		if (wrap_idx > 0) {
+			PUTS_ERR(SGR_HALF_BRIGHT_ON WRAP_CONT_MARK);
+			PUTS_ERR(SGR_RESET);
+			line_cols = (size_t)content_cols > mark_width ? (size_t)content_cols - mark_width : 1;
+		}
+
+		render_line_slice(line, len, start_col, line_cols, raw_line);
+		PUTS_ERR(SGR_RESET ERASE_TO_EOL);
+
+		start_col += line_cols;
+		wrap_idx++;
+	}
+}
+
+static bool redraw_search_transition_if_possible(size_t old_match_idx)
+{
+	if (match_count == 0 || old_match_idx >= match_count || current_match >= match_count)
+		return false;
+	if (old_match_idx == current_match)
+		return false;
+
+	size_t old_raw = matches[old_match_idx].line_idx;
+	size_t new_raw = matches[current_match].line_idx;
+	size_t old_view = 0;
+	size_t new_view = 0;
+	bool old_visible = raw_to_view_line(old_raw, &old_view);
+	bool new_visible = raw_to_view_line(new_raw, &new_view);
+
+	if ((!old_visible || old_view < scroll_line || old_view >= scroll_line + (size_t)content_rows)
+		&& (!new_visible || new_view < scroll_line || new_view >= scroll_line + (size_t)content_rows))
+		return false;
+
+	sync_frame_begin();
+	PUTS_ERR(HIDE_CURSOR);
+	if (old_visible)
+		redraw_visible_view_line(old_view);
+	if (new_visible && (!old_visible || new_view != old_view))
+		redraw_visible_view_line(new_view);
+	render_status_bar();
+	sync_frame_end();
+	FLUSH_FILE(stderr);
+	return true;
+}
+
 static void render_status_bar(void)
 {
 	size_t total = view_line_count();
@@ -2568,7 +2844,11 @@ static void render_status_bar(void)
 	} else if (status_flash[0] != '\0') {
 		snprintf(left, sizeof(left), "%s | %s", source, status_flash);
 	} else if (search_query[0] != '\0') {
-		snprintf(left, sizeof(left), "%s | /%s (%zu matches)", source, search_query, match_count);
+		if (match_count > 0 && current_match < match_count)
+			snprintf(left, sizeof(left), "%s | /%s (%zu/%zu matches)",
+				source, search_query, current_match + 1, match_count);
+		else
+			snprintf(left, sizeof(left), "%s | /%s (0 matches)", source, search_query);
 	} else {
 		snprintf(left, sizeof(left), "%s", source);
 	}
@@ -2599,7 +2879,7 @@ static void render_status_bar(void)
 	PUTS_ERR(SGR_RESET);
 }
 
-static void render(void)
+static void render_frame(bool include_status_bar)
 {
 	clear_flash_if_expired();
 	update_term_size();
@@ -2682,9 +2962,20 @@ static void render(void)
 		view_idx++;
 	}
 
-	render_status_bar();
+	if (include_status_bar)
+		render_status_bar();
 	sync_frame_end();
 	FLUSH_FILE(stderr);
+}
+
+static void render(void)
+{
+	render_frame(true);
+}
+
+static void render_without_status_bar(void)
+{
+	render_frame(false);
 }
 
 static void search_history_add(const char *query)
@@ -3011,6 +3302,7 @@ static void show_help_screen(void)
 		"  w                 toggle wrap\n"
 		"  / ?               incremental search forward/backward\n"
 		"  n / N             next/previous match\n"
+		"  Esc               clear active search\n"
 		"  :                 command line\n"
 		"  F                 enter follow mode\n"
 		"  y                 yank current line to clipboard\n"
@@ -3029,7 +3321,7 @@ static void show_help_screen(void)
 static void draw_search_prompt(char prefix, const struct prompt_buffer *prompt, bool full_redraw)
 {
 	if (full_redraw)
-		render();
+		render_without_status_bar();
 
 	sync_frame_begin();
 	PUTS_ERR(HIDE_CURSOR);
@@ -3045,10 +3337,24 @@ static void draw_search_prompt(char prefix, const struct prompt_buffer *prompt, 
 	FLUSH_FILE(stderr);
 }
 
+static size_t command_popup_row_limit(void)
+{
+	size_t limit = command_popup_rows;
+	size_t available = term_rows > 1 ? (size_t)(term_rows - 1) : 1;
+	if (limit > available)
+		limit = available;
+	if (limit > MAX_COMMAND_POPUP_ROWS)
+		limit = MAX_COMMAND_POPUP_ROWS;
+	return limit;
+}
+
 static size_t command_popup_count(const struct prompt_buffer *prompt)
 {
 	char prefix[MAX_COMMAND];
 	size_t prefix_len = 0;
+	size_t row_limit = command_popup_row_limit();
+	if (row_limit == 0)
+		return 0;
 
 	while (prefix_len < prompt->len && prefix_len + 1 < sizeof(prefix)) {
 		char ch = prompt->text[prefix_len];
@@ -3067,7 +3373,7 @@ static size_t command_popup_count(const struct prompt_buffer *prompt)
 		if (prefix_len > 0 && strncmp(commands[i].name, prefix, prefix_len) != 0)
 			continue;
 		count++;
-		if (count == COMMAND_POPUP_MAX_ROWS)
+		if (count == row_limit)
 			break;
 	}
 
@@ -3080,7 +3386,7 @@ static bool draw_command_popup(const struct prompt_buffer *prompt)
 	if (shown_count == 0)
 		return false;
 
-	const struct command_desc *shown[COMMAND_POPUP_MAX_ROWS] = {0};
+	const struct command_desc *shown[MAX_COMMAND_POPUP_ROWS] = {0};
 	size_t prefix_len = 0;
 	char prefix[MAX_COMMAND];
 
@@ -3101,7 +3407,7 @@ static bool draw_command_popup(const struct prompt_buffer *prompt)
 			break;
 	}
 
-	int popup_top = term_rows - COMMAND_POPUP_MAX_ROWS;
+	int popup_top = term_rows - (int)command_popup_row_limit();
 	if (popup_top < 1)
 		popup_top = 1;
 	int popup_bottom = term_rows - 1;
@@ -3686,6 +3992,10 @@ static void open_search_prompt(bool backward)
 	if (view_line_count() > 0)
 		anchor_raw_line = view_to_raw_line(scroll_line);
 
+	/* Opening a new search starts from a cleared query/match state. */
+	clear_matches();
+	search_query[0] = '\0';
+
 	int history_pos = -1;
 	char saved_input[MAX_QUERY] = "";
 	char original_query[MAX_QUERY] = "";
@@ -3702,11 +4012,6 @@ static void open_search_prompt(bool backward)
 		original_match = matches[current_match];
 	bool accepted = false;
 
-	if (search_query[0] != '\0') {
-		snprintf(prompt.text, sizeof(prompt.text), "%s", search_query);
-		prompt.len = strlen(prompt.text);
-		prompt.cursor = prompt.len;
-	}
 	bool full_redraw = true;
 
 	for (;;) {
@@ -3947,6 +4252,12 @@ static bool handle_key(int key)
 	}
 
 	enum pager_action action = action_for_key(key);
+	if (action == ACTION_NONE && key == KEY_ESC && search_query[0] != '\0') {
+		clear_matches();
+		search_query[0] = '\0';
+		return true;
+	}
+
 	switch (action) {
 		case ACTION_NONE:
 			return false;
@@ -3975,13 +4286,27 @@ static bool handle_key(int key)
 			open_search_prompt(true);
 			return true;
 
-		case ACTION_NEXT_MATCH:
+		case ACTION_NEXT_MATCH: {
+			size_t prev_match = current_match;
+			size_t prev_scroll_line = scroll_line;
+			size_t prev_scroll_col = scroll_col;
 			jump_to_next_match();
+			if (scroll_line == prev_scroll_line && scroll_col == prev_scroll_col
+				&& redraw_search_transition_if_possible(prev_match))
+				return false;
 			return true;
+		}
 
-		case ACTION_PREV_MATCH:
+		case ACTION_PREV_MATCH: {
+			size_t prev_match = current_match;
+			size_t prev_scroll_line = scroll_line;
+			size_t prev_scroll_col = scroll_col;
 			jump_to_prev_match();
+			if (scroll_line == prev_scroll_line && scroll_col == prev_scroll_col
+				&& redraw_search_transition_if_possible(prev_match))
+				return false;
 			return true;
+		}
 
 		case ACTION_COMMAND_PROMPT:
 			open_command_prompt();
@@ -4126,8 +4451,9 @@ static void print_usage(FILE *stream)
 		"    pattern = \"search text\"\n"
 		"    search_regex = true|false\n"
 		"    search_wrap = true|false\n"
-		"    search_current_match_sgr = \"7;93\"\n"
-		"    search_other_match_sgr = \"7\"\n"
+		"    search_current_match_sgr = \"reversed yellow\" | \"7;33\"\n"
+		"    search_other_match_sgr = \"reversed\" | \"7\"\n"
+		"    command_popup_rows = <positive integer, max 32>\n"
 		"    sync_output = true|false\n"
 		"\n"
 		"  Sections:\n"
@@ -4142,6 +4468,7 @@ static void print_usage(FILE *stream)
 		"    number = true\n"
 		"    search_regex = false\n"
 		"    search_wrap = false\n"
+		"    command_popup_rows = 8\n"
 		"    sync_output = true\n"
 		"    [keybindings]\n"
 		"    down = [\"ctrl-n\"]\n"
