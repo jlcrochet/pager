@@ -108,6 +108,8 @@ wrap = true
 number = false
 search_regex = true
 search_wrap = true
+search_current_match_sgr = "7;93"
+search_other_match_sgr = "7"
 sync_output = true
 
 [keybindings]
@@ -129,3 +131,6 @@ yank = ["y"]
 command = [":"]
 help = ["h"]
 ```
+
+`search_current_match_sgr` and `search_other_match_sgr` accept SGR parameter lists
+(for example `7;93` for reverse + bright yellow, or `7` for plain reverse).

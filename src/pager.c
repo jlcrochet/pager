@@ -31,6 +31,8 @@
 #define CONFIG_PATH_MAX 4096
 #define MAX_BINDINGS_PER_ACTION 16
 #define MAX_BINDING_TOKEN 64
+#define MAX_SGR_PARAMS 96
+#define MAX_SGR_SEQUENCE 128
 
 #define ALT_SCREEN_ENABLE CSI "?1049h"
 #define ALT_SCREEN_DISABLE CSI "?1049l"
@@ -170,6 +172,8 @@ static bool show_line_numbers = false;
 static bool follow_mode = false;
 static bool search_use_regex = true;
 static bool search_wrap = true;
+static char search_current_match_sgr[MAX_SGR_SEQUENCE] = CSI "7;93m";
+static char search_other_match_sgr[MAX_SGR_SEQUENCE] = CSI "7m";
 static bool sync_output_enabled = true;
 
 static bool running = true;
@@ -380,6 +384,48 @@ static bool parse_toml_string(const char *value, char *dst, size_t dst_size)
 	if (len + 1 > dst_size)
 		return false;
 	memcpy(dst, value, len + 1);
+	return true;
+}
+
+static bool is_valid_sgr_params(const char *s)
+{
+	if (!s || s[0] == '\0')
+		return false;
+
+	bool expect_digit = true;
+	for (size_t i = 0; s[i] != '\0'; i++) {
+		char ch = s[i];
+		if (isdigit((unsigned char)ch)) {
+			expect_digit = false;
+			continue;
+		}
+		if (ch == ';') {
+			if (expect_digit)
+				return false;
+			expect_digit = true;
+			continue;
+		}
+		return false;
+	}
+
+	return !expect_digit;
+}
+
+static bool parse_toml_sgr(const char *value, char *dst, size_t dst_size)
+{
+	char params[MAX_SGR_PARAMS];
+	if (!parse_toml_string(value, params, sizeof(params)))
+		return false;
+
+	char *trimmed = trim_left(params);
+	trim_right(trimmed);
+	if (!is_valid_sgr_params(trimmed))
+		return false;
+
+	int n = snprintf(dst, dst_size, CSI "%sm", trimmed);
+	if (n < 0 || (size_t)n >= dst_size)
+		return false;
+
 	return true;
 }
 
@@ -1039,6 +1085,24 @@ static void apply_config_kv(
 		return;
 	}
 
+	if (strcmp(key, "search_current_match_sgr") == 0) {
+		if (!parse_toml_sgr(value, search_current_match_sgr, sizeof(search_current_match_sgr))) {
+			fprintf(stderr, "pager: %s:%zu invalid SGR params for %s (example: \"7;93\")\n",
+				path, line_no, key);
+			return;
+		}
+		return;
+	}
+
+	if (strcmp(key, "search_other_match_sgr") == 0) {
+		if (!parse_toml_sgr(value, search_other_match_sgr, sizeof(search_other_match_sgr))) {
+			fprintf(stderr, "pager: %s:%zu invalid SGR params for %s (example: \"7\")\n",
+				path, line_no, key);
+			return;
+		}
+		return;
+	}
+
 	if (strcmp(key, "sync_output") == 0) {
 		bool b = false;
 		if (!parse_toml_bool(value, &b)) {
@@ -1148,6 +1212,8 @@ static bool write_generated_config(FILE *fp)
 		"# pattern = \"\"\n"
 		"# search_regex = true\n"
 		"# search_wrap = true\n"
+		"# search_current_match_sgr = \"7;93\"  # reverse + bright yellow\n"
+		"# search_other_match_sgr = \"7\"       # reverse default colors\n"
 		"# sync_output = true\n"
 		"#\n"
 		"# Keybindings: each key can map to one action.\n"
@@ -2441,10 +2507,8 @@ static void render_line_slice(const char *line, size_t len, size_t start_col, si
 		}
 
 		if (!highlight_on && should_highlight) {
-			if (should_current)
-				PUTS_ERR(SGR_BOLD_ON SGR_REVERSE_VIDEO_ON);
-			else
-				PUTS_ERR(SGR_HALF_BRIGHT_ON SGR_REVERSE_VIDEO_ON);
+			const char *style = should_current ? search_current_match_sgr : search_other_match_sgr;
+			WRITE_ERR(style, strlen(style));
 			highlight_on = true;
 			current_highlight = should_current;
 		}
@@ -4062,6 +4126,8 @@ static void print_usage(FILE *stream)
 		"    pattern = \"search text\"\n"
 		"    search_regex = true|false\n"
 		"    search_wrap = true|false\n"
+		"    search_current_match_sgr = \"7;93\"\n"
+		"    search_other_match_sgr = \"7\"\n"
 		"    sync_output = true|false\n"
 		"\n"
 		"  Sections:\n"
