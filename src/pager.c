@@ -69,6 +69,12 @@ enum config_section {
 	CONFIG_SECTION_OTHER,
 };
 
+enum search_case_mode {
+	SEARCH_CASE_SMART = 0,
+	SEARCH_CASE_INSENSITIVE,
+	SEARCH_CASE_SENSITIVE,
+};
+
 enum pager_action {
 	ACTION_NONE = 0,
 	ACTION_QUIT,
@@ -89,6 +95,8 @@ enum pager_action {
 	ACTION_SEARCH_BACKWARD,
 	ACTION_NEXT_MATCH,
 	ACTION_PREV_MATCH,
+	ACTION_NEXT_FILE,
+	ACTION_PREV_FILE,
 	ACTION_COMMAND_PROMPT,
 	ACTION_FOLLOW_MODE,
 	ACTION_YANK_LINE,
@@ -176,6 +184,7 @@ static bool show_line_numbers = false;
 static bool follow_mode = false;
 static bool search_use_regex = true;
 static bool search_wrap = true;
+static enum search_case_mode search_case = SEARCH_CASE_SMART;
 static char search_current_match_sgr[MAX_SGR_SEQUENCE] = CSI "7;33m";
 static char search_other_match_sgr[MAX_SGR_SEQUENCE] = CSI "7m";
 static size_t command_popup_rows = DEFAULT_COMMAND_POPUP_ROWS;
@@ -398,6 +407,51 @@ static bool parse_toml_string(const char *value, char *dst, size_t dst_size)
 		return false;
 	memcpy(dst, value, len + 1);
 	return true;
+}
+
+static bool parse_search_case(const char *value, enum search_case_mode *out_mode)
+{
+	if (!value || !out_mode)
+		return false;
+
+	bool b = false;
+	if (parse_toml_bool(value, &b)) {
+		*out_mode = b ? SEARCH_CASE_SENSITIVE : SEARCH_CASE_INSENSITIVE;
+		return true;
+	}
+
+	char text[MAX_BINDING_TOKEN];
+	if (!parse_toml_string(value, text, sizeof(text)))
+		return false;
+
+	size_t len = strlen(text);
+	if (len >= 2 && text[0] == '\'' && text[len - 1] == '\'') {
+		memmove(text, text + 1, len - 2);
+		text[len - 2] = '\0';
+	}
+
+	if (str_eq_ci(text, "smart")) {
+		*out_mode = SEARCH_CASE_SMART;
+		return true;
+	}
+	if (str_eq_ci(text, "true")) {
+		*out_mode = SEARCH_CASE_SENSITIVE;
+		return true;
+	}
+	if (str_eq_ci(text, "false")) {
+		*out_mode = SEARCH_CASE_INSENSITIVE;
+		return true;
+	}
+	if (str_eq_ci(text, "sensitive")) {
+		*out_mode = SEARCH_CASE_SENSITIVE;
+		return true;
+	}
+	if (str_eq_ci(text, "insensitive")) {
+		*out_mode = SEARCH_CASE_INSENSITIVE;
+		return true;
+	}
+
+	return false;
 }
 
 struct sgr_alias {
@@ -726,6 +780,8 @@ static void init_default_key_bindings(void)
 	(void)bind_key_to_action(ACTION_SEARCH_BACKWARD, '?');
 	(void)bind_key_to_action(ACTION_NEXT_MATCH, 'n');
 	(void)bind_key_to_action(ACTION_PREV_MATCH, 'N');
+	(void)bind_key_to_action(ACTION_NEXT_FILE, ']');
+	(void)bind_key_to_action(ACTION_PREV_FILE, '[');
 	(void)bind_key_to_action(ACTION_COMMAND_PROMPT, ':');
 	(void)bind_key_to_action(ACTION_FOLLOW_MODE, 'F');
 	(void)bind_key_to_action(ACTION_YANK_LINE, 'y');
@@ -912,6 +968,14 @@ static bool parse_binding_action(const char *name, enum pager_action *out_action
 	}
 	if (str_eq_ci(name, "prev_match")) {
 		*out_action = ACTION_PREV_MATCH;
+		return true;
+	}
+	if (str_eq_ci(name, "next_file")) {
+		*out_action = ACTION_NEXT_FILE;
+		return true;
+	}
+	if (str_eq_ci(name, "prev_file")) {
+		*out_action = ACTION_PREV_FILE;
 		return true;
 	}
 	if (str_eq_ci(name, "command")) {
@@ -1243,6 +1307,17 @@ static void apply_config_kv(
 		return;
 	}
 
+	if (strcmp(key, "search_case") == 0) {
+		enum search_case_mode mode = SEARCH_CASE_SMART;
+		if (!parse_search_case(value, &mode)) {
+			fprintf(stderr, "pager: %s:%zu invalid value for %s (use false, true, or \"smart\")\n",
+				path, line_no, key);
+			return;
+		}
+		search_case = mode;
+		return;
+	}
+
 	if (strcmp(key, "search_current_match_sgr") == 0) {
 		if (!parse_toml_sgr(value, search_current_match_sgr, sizeof(search_current_match_sgr))) {
 			fprintf(stderr, "pager: %s:%zu invalid SGR params/aliases for %s (example: \"reversed yellow\")\n",
@@ -1385,6 +1460,7 @@ static bool write_generated_config(FILE *fp)
 		"# pattern = \"\"\n"
 		"# search_regex = true\n"
 		"# search_wrap = true\n"
+		"# search_case = \"smart\"  # false=insensitive, true=sensitive, smart=smart-case\n"
 		"# search_current_match_sgr = \"reversed yellow\"  # aliases also accepted\n"
 		"# search_other_match_sgr = \"reversed\"\n"
 		"# command_popup_rows = 5  # max 32\n"
@@ -1411,6 +1487,8 @@ static bool write_generated_config(FILE *fp)
 		"# search_backward = [\"?\"]\n"
 		"# next_match = [\"n\"]\n"
 		"# prev_match = [\"N\"]\n"
+		"# next_file = [\"]\"]\n"
+		"# prev_file = [\"[\"]\n"
 		"# command = [\":\"]\n"
 		"# follow = [\"F\"]\n"
 		"# yank = [\"y\"]\n"
@@ -2076,6 +2154,15 @@ static bool has_uppercase(const char *text)
 	return false;
 }
 
+static bool search_ignore_case_for_pattern(const char *pattern)
+{
+	if (search_case == SEARCH_CASE_INSENSITIVE)
+		return true;
+	if (search_case == SEARCH_CASE_SENSITIVE)
+		return false;
+	return !has_uppercase(pattern);
+}
+
 static bool chars_equal(char a, char b, bool ignore_case)
 {
 	if (!ignore_case)
@@ -2114,10 +2201,15 @@ static bool find_plain_substring(
 	return false;
 }
 
-static bool compile_regex_smart(regex_t *out, const char *pattern, char *errbuf, size_t errbuf_size)
+static bool compile_regex_with_case(
+	regex_t *out,
+	const char *pattern,
+	bool ignore_case,
+	char *errbuf,
+	size_t errbuf_size)
 {
 	int flags = REG_EXTENDED;
-	if (!has_uppercase(pattern))
+	if (ignore_case)
 		flags |= REG_ICASE;
 
 	int rc = regcomp(out, pattern, flags);
@@ -2304,10 +2396,10 @@ static void find_all_matches(const char *pattern, bool preserve_current_line)
 	snprintf(search_query, sizeof(search_query), "%s", pattern);
 
 	size_t needle_len = strlen(pattern);
-	bool ignore_case = !has_uppercase(pattern);
+	bool ignore_case = search_ignore_case_for_pattern(pattern);
 
 	if (search_use_regex) {
-		if (!compile_regex_smart(&search_regex, pattern, regex_error, sizeof(regex_error))) {
+		if (!compile_regex_with_case(&search_regex, pattern, ignore_case, regex_error, sizeof(regex_error))) {
 			set_flash(regex_error[0] ? regex_error : "Invalid regex");
 			return;
 		}
@@ -2544,7 +2636,8 @@ static bool apply_filter(const char *pattern, bool quiet)
 	}
 
 	regex_t re;
-	if (!compile_regex_smart(&re, pattern, regex_error, sizeof(regex_error))) {
+	bool ignore_case = !has_uppercase(pattern);
+	if (!compile_regex_with_case(&re, pattern, ignore_case, regex_error, sizeof(regex_error))) {
 		if (!quiet)
 			set_flash(regex_error[0] ? regex_error : "Invalid filter regex");
 		return false;
@@ -3320,6 +3413,7 @@ static void show_help_screen(void)
 		"  w                 toggle wrap\n"
 		"  / ?               incremental search forward/backward\n"
 		"  n / N             next/previous match\n"
+		"  ] / [             next/previous file\n"
 		"  Esc               clear active search\n"
 		"  :                 command line\n"
 		"  F                 enter follow mode\n"
@@ -3526,6 +3620,32 @@ static bool switch_file(size_t idx, bool check_binary)
 	follow_file_offset = (off_t)buffer_size;
 
 	set_flash("File loaded");
+	return true;
+}
+
+static bool switch_to_next_file(void)
+{
+	if (file_count <= 1) {
+		set_flash("No other file");
+		return true;
+	}
+
+	size_t next = current_file + 1;
+	if (next >= file_count)
+		next = 0;
+	(void)switch_file(next, true);
+	return true;
+}
+
+static bool switch_to_prev_file(void)
+{
+	if (file_count <= 1) {
+		set_flash("No other file");
+		return true;
+	}
+
+	size_t prev = current_file == 0 ? file_count - 1 : current_file - 1;
+	(void)switch_file(prev, true);
 	return true;
 }
 
@@ -3913,20 +4033,12 @@ static bool execute_command_line(const char *input)
 	}
 
 	if (strcmp(cmd, "n") == 0) {
-		if (file_count > 1) {
-			size_t next = current_file + 1;
-			if (next >= file_count)
-				next = 0;
-			switch_file(next, true);
-		}
+		(void)switch_to_next_file();
 		return true;
 	}
 
 	if (strcmp(cmd, "p") == 0) {
-		if (file_count > 1) {
-			size_t prev = current_file == 0 ? file_count - 1 : current_file - 1;
-			switch_file(prev, true);
-		}
+		(void)switch_to_prev_file();
 		return true;
 	}
 
@@ -4389,6 +4501,12 @@ static bool handle_key(int key)
 			return true;
 		}
 
+		case ACTION_NEXT_FILE:
+			return switch_to_next_file();
+
+		case ACTION_PREV_FILE:
+			return switch_to_prev_file();
+
 		case ACTION_COMMAND_PROMPT:
 			open_command_prompt();
 			return true;
@@ -4532,6 +4650,7 @@ static void print_usage(FILE *stream)
 		"    pattern = \"search text\"\n"
 		"    search_regex = true|false\n"
 		"    search_wrap = true|false\n"
+		"    search_case = false|true|\"smart\"\n"
 		"    search_current_match_sgr = \"reversed yellow\" | \"7;33\"\n"
 		"    search_other_match_sgr = \"reversed\" | \"7\"\n"
 		"    command_popup_rows = <positive integer, max 32>\n"
@@ -4543,12 +4662,13 @@ static void print_usage(FILE *stream)
 		"  Keybinding actions:\n"
 		"    quit down up page_down page_up half_page_down half_page_up\n"
 		"    top bottom left right wrap search_forward search_backward\n"
-		"    next_match prev_match command follow yank help\n"
+		"    next_match prev_match next_file prev_file command follow yank help\n"
 		"\n"
 		"  Example:\n"
 		"    number = true\n"
 		"    search_regex = false\n"
 		"    search_wrap = false\n"
+		"    search_case = \"smart\"\n"
 		"    command_popup_rows = 8\n"
 		"    sync_output = true\n"
 		"    [keybindings]\n"

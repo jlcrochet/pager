@@ -8,13 +8,13 @@ Terminal pager for viewing files and command output, similar to `less`.
 - Line numbers
 - Regex search with match highlighting (forward and backward)
 - Incremental search while typing (`/` and `?`)
-- Smart case sensitivity (case-insensitive unless the query contains uppercase)
+- Configurable search case mode (`false` insensitive, `true` sensitive, `"smart"` smart-case)
 - Search history
 - Line filtering by regex
 - Follow mode (like `tail -f`) for files and pipes
 - Yank current line to clipboard via OSC 52
 - Command mode with autocompletion popup
-- Multi-file support with `:n` / `:p` navigation
+- Multi-file support with `:n` / `:p` and `]` / `[` navigation
 - Mouse scroll support (SGR mouse protocol)
 - ANSI color passthrough
 - Binary file detection with confirmation prompt
@@ -68,6 +68,7 @@ command | pager
 | `/` | Search forward |
 | `?` | Search backward |
 | `n` / `N` | Next / previous match |
+| `]` / `[` | Next / previous file |
 | Esc | Clear active search |
 | `F` | Enter follow mode |
 | `y` | Yank current line to clipboard |
@@ -109,6 +110,7 @@ wrap = true
 number = false
 search_regex = true
 search_wrap = true
+search_case = "smart"
 search_current_match_sgr = "reversed yellow"
 search_other_match_sgr = "reversed"
 command_popup_rows = 5
@@ -128,6 +130,8 @@ search_forward = ["/"]
 search_backward = ["?"]
 next_match = ["n"]
 prev_match = ["N"]
+next_file = ["]"]
+prev_file = ["["]
 follow = ["F"]
 yank = ["y"]
 command = [":"]
@@ -137,6 +141,9 @@ help = ["h"]
 `search_current_match_sgr` and `search_other_match_sgr` accept either numeric SGR
 codes (for example `7;33`) or common aliases (for example `reversed yellow`,
 `reversed`, `bright-yellow`, `bg-blue`).
+
+`search_case` accepts `false` (always case-insensitive), `true` (always case-sensitive),
+or `"smart"` (case-insensitive unless the query has uppercase). Default is `"smart"`.
 
 `command_popup_rows` controls the maximum number of command suggestions shown in
 the `:` popup (default `5`, max `32`).
