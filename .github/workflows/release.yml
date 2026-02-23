@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Package
+        run: gzip -c pager > pager-linux-x86_64.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pager-linux-x86_64.gz
+          path: pager-linux-x86_64.gz
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pager-linux-x86_64.gz
