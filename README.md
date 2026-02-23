@@ -7,6 +7,7 @@ Terminal pager for viewing files and command output, similar to `less`.
 - Line wrapping (on by default, togglable)
 - Line numbers
 - Regex search with match highlighting (forward and backward)
+- Incremental search while typing (`/` and `?`)
 - Smart case sensitivity (case-insensitive unless the query contains uppercase)
 - Search history
 - Line filtering by regex

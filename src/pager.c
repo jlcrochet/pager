@@ -2061,6 +2061,8 @@ static void find_all_matches(const char *pattern, bool preserve_current_line)
 		return;
 	}
 
+	snprintf(search_query, sizeof(search_query), "%s", pattern);
+
 	size_t needle_len = strlen(pattern);
 	bool ignore_case = !has_uppercase(pattern);
 
@@ -2071,8 +2073,6 @@ static void find_all_matches(const char *pattern, bool preserve_current_line)
 		}
 		search_regex_valid = true;
 	}
-
-	snprintf(search_query, sizeof(search_query), "%s", pattern);
 
 	size_t view_count = view_line_count();
 	char *plain = NULL;
@@ -2206,6 +2206,80 @@ static void jump_to_prev_match(void)
 	}
 
 	ensure_match_visible(current_match);
+}
+
+static void apply_search_query_from_anchor(const char *query, bool backward, size_t anchor_raw_line)
+{
+	if (!query || query[0] == '\0') {
+		clear_matches();
+		search_query[0] = '\0';
+		return;
+	}
+
+	search_forward = !backward;
+	find_all_matches(query, false);
+	if (match_count == 0)
+		return;
+
+	if (backward) {
+		size_t idx = match_count - 1;
+		for (size_t i = match_count; i > 0; i--) {
+			if (matches[i - 1].line_idx <= anchor_raw_line) {
+				idx = i - 1;
+				break;
+			}
+		}
+		current_match = idx;
+	} else {
+		size_t idx = 0;
+		while (idx < match_count && matches[idx].line_idx < anchor_raw_line)
+			idx++;
+		if (idx >= match_count)
+			idx = 0;
+		current_match = idx;
+	}
+
+	ensure_match_visible(current_match);
+}
+
+static void restore_search_state_after_cancel(
+	const char *saved_query,
+	bool saved_search_forward,
+	bool saved_match_valid,
+	struct search_match saved_match,
+	size_t saved_scroll_line,
+	size_t saved_scroll_col,
+	const char *saved_flash,
+	uint64_t saved_flash_until)
+{
+	search_forward = saved_search_forward;
+
+	if (!saved_query || saved_query[0] == '\0') {
+		clear_matches();
+		search_query[0] = '\0';
+	} else {
+		find_all_matches(saved_query, false);
+		if (saved_match_valid && match_count > 0) {
+			for (size_t i = 0; i < match_count; i++) {
+				if (matches[i].line_idx != saved_match.line_idx)
+					continue;
+				if (matches[i].start != saved_match.start)
+					continue;
+				if (matches[i].end != saved_match.end)
+					continue;
+				current_match = i;
+				break;
+			}
+			ensure_match_visible(current_match);
+		}
+	}
+
+	scroll_line = saved_scroll_line;
+	scroll_col = saved_scroll_col;
+	clamp_scroll();
+
+	snprintf(status_flash, sizeof(status_flash), "%s", saved_flash ? saved_flash : "");
+	status_flash_until = saved_flash_until;
 }
 
 static void clear_filter(void)
@@ -2871,7 +2945,7 @@ static void show_help_screen(void)
 		"  G / End           bottom\n"
 		"  Left / Right      horizontal scroll in nowrap\n"
 		"  w                 toggle wrap\n"
-		"  / ?               search forward/backward\n"
+		"  / ?               incremental search forward/backward\n"
 		"  n / N             next/previous match\n"
 		"  :                 command line\n"
 		"  F                 enter follow mode\n"
@@ -3544,8 +3618,25 @@ static void open_search_prompt(bool backward)
 		.cursor = 0,
 	};
 
+	size_t anchor_raw_line = 0;
+	if (view_line_count() > 0)
+		anchor_raw_line = view_to_raw_line(scroll_line);
+
 	int history_pos = -1;
 	char saved_input[MAX_QUERY] = "";
+	char original_query[MAX_QUERY] = "";
+	snprintf(original_query, sizeof(original_query), "%s", search_query);
+	bool original_search_forward = search_forward;
+	size_t original_scroll_line = scroll_line;
+	size_t original_scroll_col = scroll_col;
+	char original_flash[sizeof(status_flash)] = "";
+	snprintf(original_flash, sizeof(original_flash), "%s", status_flash);
+	uint64_t original_flash_until = status_flash_until;
+	bool original_match_valid = match_count > 0 && current_match < match_count;
+	struct search_match original_match = {0};
+	if (original_match_valid)
+		original_match = matches[current_match];
+	bool accepted = false;
 
 	if (search_query[0] != '\0') {
 		snprintf(prompt.text, sizeof(prompt.text), "%s", search_query);
@@ -3571,17 +3662,10 @@ static void open_search_prompt(bool backward)
 			continue;
 
 		if (key == '\n' || key == '\r' || key == K_ENTER) {
-			if (prompt.len == 0) {
-				clear_matches();
-				search_query[0] = '\0';
-			} else {
-				search_forward = !backward;
-				find_all_matches(prompt.text, false);
-				if (match_count > 0 && backward)
-					current_match = match_count - 1;
-				ensure_match_visible(current_match);
+			apply_search_query_from_anchor(prompt.text, backward, anchor_raw_line);
+			if (prompt.len > 0)
 				search_history_add(prompt.text);
-			}
+			accepted = true;
 			break;
 		}
 
@@ -3598,6 +3682,8 @@ static void open_search_prompt(bool backward)
 			snprintf(prompt.text, sizeof(prompt.text), "%s", search_history[history_pos]);
 			prompt.len = strlen(prompt.text);
 			prompt.cursor = prompt.len;
+			apply_search_query_from_anchor(prompt.text, backward, anchor_raw_line);
+			full_redraw = true;
 			continue;
 		}
 
@@ -3611,30 +3697,40 @@ static void open_search_prompt(bool backward)
 			}
 			prompt.len = strlen(prompt.text);
 			prompt.cursor = prompt.len;
+			apply_search_query_from_anchor(prompt.text, backward, anchor_raw_line);
+			full_redraw = true;
 			continue;
 		}
 
 		if (key == K_DEL) {
 			prompt_delete_before(&prompt);
 			history_pos = -1;
+			apply_search_query_from_anchor(prompt.text, backward, anchor_raw_line);
+			full_redraw = true;
 			continue;
 		}
 
 		if (key == KEY_DELETE) {
 			prompt_delete_at(&prompt);
 			history_pos = -1;
+			apply_search_query_from_anchor(prompt.text, backward, anchor_raw_line);
+			full_redraw = true;
 			continue;
 		}
 
 		if (key == K_CTRL_U) {
 			prompt_delete_to_start(&prompt);
 			history_pos = -1;
+			apply_search_query_from_anchor(prompt.text, backward, anchor_raw_line);
+			full_redraw = true;
 			continue;
 		}
 
 		if (key == K_CTRL_W || key == K_CTRL_H) {
 			prompt_delete_word_before(&prompt);
 			history_pos = -1;
+			apply_search_query_from_anchor(prompt.text, backward, anchor_raw_line);
+			full_redraw = true;
 			continue;
 		}
 
@@ -3663,7 +3759,21 @@ static void open_search_prompt(bool backward)
 		if (key >= 32 && key <= 126) {
 			prompt_insert(&prompt, key);
 			history_pos = -1;
+			apply_search_query_from_anchor(prompt.text, backward, anchor_raw_line);
+			full_redraw = true;
 		}
+	}
+
+	if (!accepted) {
+		restore_search_state_after_cancel(
+			original_query,
+			original_search_forward,
+			original_match_valid,
+			original_match,
+			original_scroll_line,
+			original_scroll_col,
+			original_flash,
+			original_flash_until);
 	}
 
 	PUTS_ERR(HIDE_CURSOR);
