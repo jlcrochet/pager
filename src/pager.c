@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <poll.h>
 #include <regex.h>
 #include <signal.h>
@@ -333,9 +334,17 @@ static bool parse_toml_bool(const char *value, bool *out)
 
 static bool parse_toml_size(const char *value, size_t *out)
 {
+	if (!value || !out || value[0] == '\0')
+		return false;
+	if (value[0] == '+' || value[0] == '-')
+		return false;
+
+	errno = 0;
 	char *end = NULL;
 	unsigned long long v = strtoull(value, &end, 10);
-	if (!end || *end != '\0' || v == 0)
+	if (!end || end == value || *end != '\0' || v == 0 || errno == ERANGE)
+		return false;
+	if (v > (unsigned long long)SIZE_MAX)
 		return false;
 	*out = (size_t)v;
 	return true;
@@ -1036,16 +1045,19 @@ static bool parse_binding_key_value(const char *value, int *keys, size_t keys_ca
 
 static bool resolve_default_config_path(char *path, size_t path_size)
 {
+	const char *xdg = getenv("XDG_CONFIG_HOME");
+	if (xdg && xdg[0] != '\0') {
+		int n = snprintf(path, path_size, "%s/pager.toml", xdg);
+		if (n < 0 || (size_t)n >= path_size)
+			return false;
+		return true;
+	}
+
 	const char *home = getenv("HOME");
 	if (!home || home[0] == '\0')
 		return false;
 
-	const char *xdg = getenv("XDG_CONFIG_HOME");
-	int n = 0;
-	if (xdg && xdg[0] != '\0')
-		n = snprintf(path, path_size, "%s/pager.toml", xdg);
-	else
-		n = snprintf(path, path_size, "%s/.config/pager.toml", home);
+	int n = snprintf(path, path_size, "%s/.config/pager.toml", home);
 
 	if (n < 0 || (size_t)n >= path_size)
 		return false;
@@ -1095,7 +1107,11 @@ static bool ensure_config_parent_dirs(const char *config_path)
 		return false;
 
 	char tmp[CONFIG_PATH_MAX];
-	snprintf(tmp, sizeof(tmp), "%s", config_path);
+	int n = snprintf(tmp, sizeof(tmp), "%s", config_path);
+	if (n < 0 || (size_t)n >= sizeof(tmp)) {
+		errno = ENAMETOOLONG;
+		return false;
+	}
 
 	char *slash = strrchr(tmp, '/');
 	if (!slash)
@@ -1125,7 +1141,9 @@ static bool resolve_config_path(char *path, size_t path_size)
 {
 	const char *explicit_path = getenv("PAGER_CONFIG");
 	if (explicit_path && explicit_path[0] != '\0') {
-		snprintf(path, path_size, "%s", explicit_path);
+		int n = snprintf(path, path_size, "%s", explicit_path);
+		if (n < 0 || (size_t)n >= path_size)
+			return false;
 		return true;
 	}
 
@@ -2746,13 +2764,13 @@ static void redraw_visible_view_line(size_t view_idx)
 		return;
 
 	size_t raw_line = view_to_raw_line(view_idx);
-	size_t len = 0;
-	const char *line = get_line(raw_line, &len);
+	size_t line_len = 0;
+	const char *line = get_line(raw_line, &line_len);
 
 	if (!wrap_mode) {
 		PRINTF_ERR(CUP(%zu, 1), row_start + 1);
 		draw_gutter(raw_line, false);
-		render_line_slice(line, len, scroll_col, (size_t)content_cols, raw_line);
+		render_line_slice(line, line_len, scroll_col, (size_t)content_cols, raw_line);
 		PUTS_ERR(SGR_RESET ERASE_TO_EOL);
 		return;
 	}
@@ -2772,7 +2790,7 @@ static void redraw_visible_view_line(size_t view_idx)
 			line_cols = (size_t)content_cols > mark_width ? (size_t)content_cols - mark_width : 1;
 		}
 
-		render_line_slice(line, len, start_col, line_cols, raw_line);
+		render_line_slice(line, line_len, start_col, line_cols, raw_line);
 		PUTS_ERR(SGR_RESET ERASE_TO_EOL);
 
 		start_col += line_cols;
@@ -3524,6 +3542,62 @@ static void refresh_after_content_update(void)
 	clamp_scroll();
 }
 
+static void append_line_index_from(size_t start_offset)
+{
+	if (start_offset > buffer_size)
+		start_offset = buffer_size;
+
+	if (!line_offsets || line_count == 0 || !line_match_first || !line_match_count) {
+		build_line_index();
+		return;
+	}
+
+	size_t extra_newlines = 0;
+	for (size_t i = start_offset; i < buffer_size; i++) {
+		if (buffer[i] == '\n')
+			extra_newlines++;
+	}
+	if (extra_newlines == 0)
+		return;
+
+	size_t needed = line_count + extra_newlines;
+	if (needed > line_capacity) {
+		size_t *new_offsets = realloc(line_offsets, needed * sizeof(size_t));
+		if (!new_offsets)
+			die("realloc");
+		line_offsets = new_offsets;
+		line_capacity = needed;
+	}
+
+	size_t old_line_count = line_count;
+	for (size_t i = start_offset; i < buffer_size; i++) {
+		if (buffer[i] == '\n')
+			line_offsets[line_count++] = i + 1;
+	}
+
+	size_t *new_line_match_first = realloc(line_match_first, line_count * sizeof(size_t));
+	size_t *new_line_match_count = realloc(line_match_count, line_count * sizeof(size_t));
+	if (!new_line_match_first || !new_line_match_count)
+		die("realloc");
+
+	line_match_first = new_line_match_first;
+	line_match_count = new_line_match_count;
+	memset(line_match_first + old_line_count, 0, (line_count - old_line_count) * sizeof(size_t));
+	memset(line_match_count + old_line_count, 0, (line_count - old_line_count) * sizeof(size_t));
+}
+
+static void refresh_after_append(size_t old_buffer_size)
+{
+	if (filter_active || search_query[0] != '\0') {
+		refresh_after_content_update();
+		return;
+	}
+
+	append_line_index_from(old_buffer_size);
+	update_term_size();
+	clamp_scroll();
+}
+
 static bool read_new_data_pipe(void)
 {
 	if (follow_pipe_fd < 0)
@@ -3537,6 +3611,7 @@ static bool read_new_data_pipe(void)
 	}
 
 	bool changed = false;
+	size_t old_buffer_size = buffer_size;
 	char tmp[4096];
 
 	for (;;) {
@@ -3562,7 +3637,7 @@ static bool read_new_data_pipe(void)
 	}
 
 	if (changed)
-		refresh_after_content_update();
+		refresh_after_append(old_buffer_size);
 
 	return changed;
 }
@@ -3595,6 +3670,7 @@ static bool read_new_data_file(void)
 	}
 
 	bool changed = false;
+	size_t old_buffer_size = buffer_size;
 	char tmp[4096];
 
 	for (;;) {
@@ -3617,7 +3693,7 @@ static bool read_new_data_file(void)
 
 	if (changed) {
 		follow_file_offset = (off_t)buffer_size;
-		refresh_after_content_update();
+		refresh_after_append(old_buffer_size);
 	}
 
 	return changed;
@@ -3799,7 +3875,11 @@ static bool execute_command_line(const char *input)
 		return false;
 
 	if (string_is_number(cmd)) {
-		size_t line_num = strtoull(cmd, NULL, 10);
+		size_t line_num = 0;
+		if (!parse_toml_size(cmd, &line_num)) {
+			set_flash("Invalid line number");
+			return true;
+		}
 		go_to_line(line_num);
 		return true;
 	}
@@ -3992,12 +4072,6 @@ static void open_search_prompt(bool backward)
 	if (view_line_count() > 0)
 		anchor_raw_line = view_to_raw_line(scroll_line);
 
-	/* Opening a new search starts from a cleared query/match state. */
-	clear_matches();
-	search_query[0] = '\0';
-
-	int history_pos = -1;
-	char saved_input[MAX_QUERY] = "";
 	char original_query[MAX_QUERY] = "";
 	snprintf(original_query, sizeof(original_query), "%s", search_query);
 	bool original_search_forward = search_forward;
@@ -4010,6 +4084,13 @@ static void open_search_prompt(bool backward)
 	struct search_match original_match = {0};
 	if (original_match_valid)
 		original_match = matches[current_match];
+
+	/* Opening a new search starts from a cleared query/match state. */
+	clear_matches();
+	search_query[0] = '\0';
+
+	int history_pos = -1;
+	char saved_input[MAX_QUERY] = "";
 	bool accepted = false;
 
 	bool full_redraw = true;
@@ -4547,13 +4628,10 @@ int main(int argc, char **argv)
 				follow_mode = true;
 				break;
 			case 'l': {
-				char *end = NULL;
-				unsigned long long value = strtoull(optarg, &end, 10);
-				if (!end || *end != '\0' || value == 0) {
+				if (!parse_toml_size(optarg, &start_line)) {
 					fprintf(stderr, "Invalid line number: %s\n", optarg);
 					return EXIT_FAILURE;
 				}
-				start_line = (size_t)value;
 				break;
 			}
 			case 'p':
@@ -4596,13 +4674,22 @@ int main(int argc, char **argv)
 		if (follow_pipe_fd < 0)
 			die("dup");
 
-		load_fd(STDIN_FILENO);
-		build_line_index();
+		if (follow_mode) {
+			/*
+			 * In follow mode, avoid blocking until EOF on endless streams.
+			 * Read what is currently available and continue in follow_tick().
+			 */
+			if (!read_new_data_pipe())
+				build_line_index();
+		} else {
+			load_fd(STDIN_FILENO);
+			build_line_index();
+		}
 
 		if (!freopen("/dev/tty", "r", stdin))
 			die("freopen /dev/tty");
 
-		if (is_probably_binary(buffer, buffer_size) && !prompt_binary_open("[stdin]"))
+		if (buffer_size > 0 && is_probably_binary(buffer, buffer_size) && !prompt_binary_open("[stdin]"))
 			return EXIT_FAILURE;
 	} else {
 		if (!switch_file(0, true))

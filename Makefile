@@ -1,5 +1,6 @@
 CC ?= clang
-CFLAGS := -O3 -ffast-math
+CFLAGS ?= -O2
+LDFLAGS ?=
 
 BIN := pager
 SRC := src/pager.c
@@ -8,7 +9,9 @@ all: $(BIN)
 
 $(BIN): $(SRC) $(wildcard src/lib/*.h)
 	$(CC) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS)
+ifndef DEBUG
 	strip $@
+endif
 
 install: $(BIN)
 	install -d ~/.local/bin
