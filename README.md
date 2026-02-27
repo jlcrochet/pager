@@ -44,6 +44,7 @@ command | pager
 | `-N`, `--number` | Show line numbers |
 | `-S`, `--nowrap` | Disable line wrapping |
 | `-F`, `--follow` | Start in follow mode |
+| `--quit-if-one-screen` | Quit after printing if one known-size input fits one terminal page |
 | `-l`, `--line N` | Start at line N |
 | `-p`, `--pattern P` | Start with search pattern |
 | `--sync-output` | Enable synchronized output rendering |
@@ -115,6 +116,7 @@ search_current_match_sgr = "reversed yellow"
 search_other_match_sgr = "reversed"
 command_popup_rows = 5
 sync_output = true
+quit_if_one_screen = false
 
 [keybindings]
 quit = ["q"]
@@ -147,3 +149,6 @@ or `"smart"` (case-insensitive unless the query has uppercase). Default is `"sma
 
 `command_popup_rows` controls the maximum number of command suggestions shown in
 the `:` popup (default `5`, max `32`).
+
+`quit_if_one_screen` enables less-style auto-quit behavior for a single known-size
+input that fits the current terminal page.

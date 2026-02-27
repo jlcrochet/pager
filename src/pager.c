@@ -189,6 +189,7 @@ static char search_current_match_sgr[MAX_SGR_SEQUENCE] = CSI "7;33m";
 static char search_other_match_sgr[MAX_SGR_SEQUENCE] = CSI "7m";
 static size_t command_popup_rows = DEFAULT_COMMAND_POPUP_ROWS;
 static bool sync_output_enabled = true;
+static bool quit_if_one_screen = false;
 
 static bool running = true;
 
@@ -1361,6 +1362,16 @@ static void apply_config_kv(
 		return;
 	}
 
+	if (strcmp(key, "quit_if_one_screen") == 0) {
+		bool b = false;
+		if (!parse_toml_bool(value, &b)) {
+			fprintf(stderr, "pager: %s:%zu invalid boolean for %s\n", path, line_no, key);
+			return;
+		}
+		quit_if_one_screen = b;
+		return;
+	}
+
 	if (strcmp(key, "line") == 0) {
 		size_t n = 0;
 		if (!parse_toml_size(value, &n)) {
@@ -1465,6 +1476,7 @@ static bool write_generated_config(FILE *fp)
 		"# search_other_match_sgr = \"reversed\"\n"
 		"# command_popup_rows = 5  # max 32\n"
 		"# sync_output = true\n"
+		"# quit_if_one_screen = false\n"
 		"#\n"
 		"# Keybindings: each key can map to one action.\n"
 		"# Defining a key here moves it from any previous action.\n"
@@ -4632,6 +4644,57 @@ static void run(void)
 	}
 }
 
+static bool input_fits_terminal_page(void)
+{
+	struct winsize ws;
+	size_t max_rows = 24;
+	size_t cols = 80;
+	if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+		max_rows = (size_t)ws.ws_row;
+		cols = (size_t)ws.ws_col;
+	}
+
+	size_t used_rows = 0;
+
+	for (size_t line_idx = 0; line_idx < line_count; line_idx++) {
+		size_t len = 0;
+		const char *line = get_line(line_idx, &len);
+		size_t width = display_width(line, len);
+		size_t line_rows = width == 0 ? 1 : (width + cols - 1) / cols;
+
+		if (line_rows > max_rows || used_rows > max_rows - line_rows)
+			return false;
+
+		used_rows += line_rows;
+	}
+
+	return true;
+}
+
+static void write_buffer_to_terminal(void)
+{
+	if (buffer_size == 0)
+		return;
+
+	int out_fd = STDERR_FILENO;
+	if (!isatty(out_fd) && isatty(STDOUT_FILENO))
+		out_fd = STDOUT_FILENO;
+
+	const char *p = buffer;
+	size_t remaining = buffer_size;
+	while (remaining > 0) {
+		ssize_t n = write(out_fd, p, remaining);
+		if (n > 0) {
+			p += (size_t)n;
+			remaining -= (size_t)n;
+			continue;
+		}
+		if (n < 0 && errno == EINTR)
+			continue;
+		die("write");
+	}
+}
+
 static void print_usage(FILE *stream)
 {
 	fprintf(stream,
@@ -4655,6 +4718,7 @@ static void print_usage(FILE *stream)
 		"    search_other_match_sgr = \"reversed\" | \"7\"\n"
 		"    command_popup_rows = <positive integer, max 32>\n"
 		"    sync_output = true|false\n"
+		"    quit_if_one_screen = true|false\n"
 		"\n"
 		"  Sections:\n"
 		"    [keybindings]\n"
@@ -4679,6 +4743,8 @@ static void print_usage(FILE *stream)
 		"  -N, --number      Show line numbers\n"
 		"  -S, --nowrap      Start in horizontal scroll mode\n"
 		"  -F, --follow      Start in follow mode\n"
+		"      --quit-if-one-screen\n"
+		"                    Quit after printing if one known-size input fits one terminal page\n"
 		"  -l, --line N      Start at line N\n"
 		"  -p, --pattern P   Start with search pattern\n"
 		"      --sync-output Enable synchronized output rendering\n"
@@ -4712,12 +4778,14 @@ int main(int argc, char **argv)
 		OPT_GENERATE_CONFIG = 1000,
 		OPT_SYNC_OUTPUT,
 		OPT_NO_SYNC_OUTPUT,
+		OPT_QUIT_IF_ONE_SCREEN,
 	};
 
 	struct option options[] = {
 		{ "number", no_argument, 0, 'N' },
 		{ "nowrap", no_argument, 0, 'S' },
 		{ "follow", no_argument, 0, 'F' },
+		{ "quit-if-one-screen", no_argument, 0, OPT_QUIT_IF_ONE_SCREEN },
 		{ "line", required_argument, 0, 'l' },
 		{ "pattern", required_argument, 0, 'p' },
 		{ "sync-output", no_argument, 0, OPT_SYNC_OUTPUT },
@@ -4730,6 +4798,7 @@ int main(int argc, char **argv)
 	size_t start_line = 0;
 	char start_pattern[MAX_QUERY] = "";
 	bool has_start_pattern = false;
+	bool input_size_known = false;
 
 	init_default_key_bindings();
 	if (!args_request_generate_config(argc, argv))
@@ -4746,6 +4815,9 @@ int main(int argc, char **argv)
 				break;
 			case 'F':
 				follow_mode = true;
+				break;
+			case OPT_QUIT_IF_ONE_SCREEN:
+				quit_if_one_screen = true;
 				break;
 			case 'l': {
 				if (!parse_toml_size(optarg, &start_line)) {
@@ -4788,6 +4860,10 @@ int main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 
+		struct stat st;
+		if (fstat(STDIN_FILENO, &st) == 0 && S_ISREG(st.st_mode))
+			input_size_known = true;
+
 		source_is_stdin = true;
 		stdin_was_pipe = true;
 		follow_pipe_fd = dup(STDIN_FILENO);
@@ -4806,14 +4882,37 @@ int main(int argc, char **argv)
 			build_line_index();
 		}
 
+		if (quit_if_one_screen
+			&& input_size_known
+			&& !follow_mode
+			&& input_fits_terminal_page()) {
+			write_buffer_to_terminal();
+			return EXIT_SUCCESS;
+		}
+
 		if (!freopen("/dev/tty", "r", stdin))
 			die("freopen /dev/tty");
 
 		if (buffer_size > 0 && is_probably_binary(buffer, buffer_size) && !prompt_binary_open("[stdin]"))
 			return EXIT_FAILURE;
 	} else {
+		if (file_count == 1) {
+			struct stat st;
+			if (stat(filenames[0], &st) == 0 && S_ISREG(st.st_mode))
+				input_size_known = true;
+		}
+
 		if (!switch_file(0, true))
 			return EXIT_FAILURE;
+	}
+
+	if (quit_if_one_screen
+		&& input_size_known
+		&& file_count == 1
+		&& !follow_mode
+		&& input_fits_terminal_page()) {
+		write_buffer_to_terminal();
+		return EXIT_SUCCESS;
 	}
 
 	if (start_line > 0)
