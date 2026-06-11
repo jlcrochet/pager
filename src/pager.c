@@ -2724,6 +2724,23 @@ static void draw_gutter(size_t raw_line, bool continuation)
 	PUTS_ERR(SGR_RESET);
 }
 
+static size_t wrap_prefix_cols(void)
+{
+	if (content_cols <= 1)
+		return 0;
+	if (content_cols > 2)
+		return 2;
+	return 1;
+}
+
+static void draw_wrap_prefix(void)
+{
+	PUTS_ERR(SGR_HALF_BRIGHT_ON WRAP_CONT_MARK);
+	if (content_cols > 2)
+		PUTC_ERR(' ');
+	PUTS_ERR(SGR_RESET);
+}
+
 static void render_line_slice(const char *line, size_t len, size_t start_col, size_t max_cols, size_t raw_line)
 {
 	struct sgr_state sgr;
@@ -2823,8 +2840,8 @@ static size_t rendered_rows_for_line(const char *line, size_t len)
 	if (width <= first_cols)
 		return 1;
 
-	size_t mark_width = display_width(WRAP_CONT_MARK, strlen(WRAP_CONT_MARK));
-	size_t cont_cols = first_cols > mark_width ? first_cols - mark_width : 1;
+	size_t prefix_cols = wrap_prefix_cols();
+	size_t cont_cols = first_cols > prefix_cols ? first_cols - prefix_cols : 1;
 	size_t remaining = width - first_cols;
 	return 1 + (remaining + cont_cols - 1) / cont_cols;
 }
@@ -2880,7 +2897,6 @@ static void redraw_visible_view_line(size_t view_idx)
 		return;
 	}
 
-	size_t mark_width = display_width(WRAP_CONT_MARK, strlen(WRAP_CONT_MARK));
 	size_t start_col = 0;
 	size_t wrap_idx = 0;
 
@@ -2890,9 +2906,9 @@ static void redraw_visible_view_line(size_t view_idx)
 
 		size_t line_cols = (size_t)content_cols;
 		if (wrap_idx > 0) {
-			PUTS_ERR(SGR_HALF_BRIGHT_ON WRAP_CONT_MARK);
-			PUTS_ERR(SGR_RESET);
-			line_cols = (size_t)content_cols > mark_width ? (size_t)content_cols - mark_width : 1;
+			draw_wrap_prefix();
+			size_t prefix_cols = wrap_prefix_cols();
+			line_cols = (size_t)content_cols > prefix_cols ? (size_t)content_cols - prefix_cols : 1;
 		}
 
 		render_line_slice(line, line_len, start_col, line_cols, raw_line);
@@ -3047,13 +3063,8 @@ static void render_frame(bool include_status_bar)
 
 					size_t prefix_cols = 0;
 					if (wrap_idx > 0 && content_cols > 1) {
-						PUTS_ERR(SGR_HALF_BRIGHT_ON WRAP_CONT_MARK);
-						prefix_cols = 1;
-						if (content_cols > 2) {
-							PUTC_ERR(' ');
-							prefix_cols = 2;
-						}
-						PUTS_ERR(SGR_RESET);
+						draw_wrap_prefix();
+						prefix_cols = wrap_prefix_cols();
 					}
 
 					size_t line_cols = (size_t)content_cols;
@@ -3912,7 +3923,7 @@ static void restore_terminal_state(void)
 	}
 
 	sync_frame_end();
-	PUTS_ERR(SHOW_CURSOR DISABLE_X11_MOUSE DISABLE_SGR_MOUSE SGR_RESET);
+	PUTS_ERR(SHOW_CURSOR DISABLE_X11_MOUSE DISABLE_SGR_MOUSE SET_AUTOWRAP SGR_RESET);
 	if (alternate_screen_enabled) {
 		PUTS_ERR(ALT_SCREEN_DISABLE);
 		alternate_screen_enabled = false;
@@ -3964,7 +3975,7 @@ static void enable_raw_mode(void)
 
 	setvbuf(stdin, NULL, _IONBF, 0);
 
-	PUTS_ERR(ALT_SCREEN_ENABLE ENABLE_X11_MOUSE ENABLE_SGR_MOUSE HIDE_CURSOR HOME CLS);
+	PUTS_ERR(ALT_SCREEN_ENABLE RESET_AUTOWRAP ENABLE_X11_MOUSE ENABLE_SGR_MOUSE HIDE_CURSOR HOME CLS);
 	alternate_screen_enabled = true;
 }
 
@@ -3977,7 +3988,7 @@ static void resume_after_suspend(void)
 		die("tcsetattr");
 	raw_mode_enabled = true;
 
-	PUTS_ERR(ALT_SCREEN_ENABLE ENABLE_X11_MOUSE ENABLE_SGR_MOUSE HIDE_CURSOR HOME CLS);
+	PUTS_ERR(ALT_SCREEN_ENABLE RESET_AUTOWRAP ENABLE_X11_MOUSE ENABLE_SGR_MOUSE HIDE_CURSOR HOME CLS);
 	alternate_screen_enabled = true;
 
 	signal(SIGTSTP, handle_sigtstp);
@@ -4882,6 +4893,9 @@ int main(int argc, char **argv)
 			build_line_index();
 		}
 
+		if (!follow_mode && buffer_size == 0)
+			return EXIT_SUCCESS;
+
 		if (quit_if_one_screen
 			&& input_size_known
 			&& !follow_mode
@@ -4905,6 +4919,9 @@ int main(int argc, char **argv)
 		if (!switch_file(0, true))
 			return EXIT_FAILURE;
 	}
+
+	if (!follow_mode && file_count == 1 && buffer_size == 0)
+		return EXIT_SUCCESS;
 
 	if (quit_if_one_screen
 		&& input_size_known
