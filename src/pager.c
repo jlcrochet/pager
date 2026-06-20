@@ -2105,9 +2105,9 @@ static void load_fd(int fd)
 
 static void build_line_index(void)
 {
-	size_t count = 1;
+	size_t count = buffer_size > 0 ? 1 : 0;
 	for (size_t i = 0; i < buffer_size; i++) {
-		if (buffer[i] == '\n')
+		if (buffer[i] == '\n' && i + 1 < buffer_size)
 			count++;
 	}
 
@@ -2119,10 +2119,11 @@ static void build_line_index(void)
 		line_capacity = count;
 	}
 
-	line_offsets[0] = 0;
-	line_count = 1;
+	line_count = 0;
+	if (count > 0)
+		line_offsets[line_count++] = 0;
 	for (size_t i = 0; i < buffer_size; i++) {
-		if (buffer[i] == '\n')
+		if (buffer[i] == '\n' && i + 1 < buffer_size)
 			line_offsets[line_count++] = i + 1;
 	}
 
@@ -2130,7 +2131,7 @@ static void build_line_index(void)
 	free(line_match_count);
 	line_match_first = calloc(line_count, sizeof(size_t));
 	line_match_count = calloc(line_count, sizeof(size_t));
-	if (!line_match_first || !line_match_count)
+	if (line_count > 0 && (!line_match_first || !line_match_count))
 		die("calloc");
 }
 
@@ -3685,58 +3686,17 @@ static void refresh_after_content_update(void)
 	clamp_scroll();
 }
 
-static void append_line_index_from(size_t start_offset)
-{
-	if (start_offset > buffer_size)
-		start_offset = buffer_size;
-
-	if (!line_offsets || line_count == 0 || !line_match_first || !line_match_count) {
-		build_line_index();
-		return;
-	}
-
-	size_t extra_newlines = 0;
-	for (size_t i = start_offset; i < buffer_size; i++) {
-		if (buffer[i] == '\n')
-			extra_newlines++;
-	}
-	if (extra_newlines == 0)
-		return;
-
-	size_t needed = line_count + extra_newlines;
-	if (needed > line_capacity) {
-		size_t *new_offsets = realloc(line_offsets, needed * sizeof(size_t));
-		if (!new_offsets)
-			die("realloc");
-		line_offsets = new_offsets;
-		line_capacity = needed;
-	}
-
-	size_t old_line_count = line_count;
-	for (size_t i = start_offset; i < buffer_size; i++) {
-		if (buffer[i] == '\n')
-			line_offsets[line_count++] = i + 1;
-	}
-
-	size_t *new_line_match_first = realloc(line_match_first, line_count * sizeof(size_t));
-	size_t *new_line_match_count = realloc(line_match_count, line_count * sizeof(size_t));
-	if (!new_line_match_first || !new_line_match_count)
-		die("realloc");
-
-	line_match_first = new_line_match_first;
-	line_match_count = new_line_match_count;
-	memset(line_match_first + old_line_count, 0, (line_count - old_line_count) * sizeof(size_t));
-	memset(line_match_count + old_line_count, 0, (line_count - old_line_count) * sizeof(size_t));
-}
-
 static void refresh_after_append(size_t old_buffer_size)
 {
+	(void)old_buffer_size;
+
 	if (filter_active || search_query[0] != '\0') {
 		refresh_after_content_update();
 		return;
 	}
 
-	append_line_index_from(old_buffer_size);
+	// ponytail: rebuild on append; incremental offsets can come back if follow-mode profiling needs it.
+	build_line_index();
 	update_term_size();
 	clamp_scroll();
 }
