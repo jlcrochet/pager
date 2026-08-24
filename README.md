@@ -44,6 +44,9 @@ command | pager
 | `-N`, `--number` | Show line numbers |
 | `-S`, `--nowrap` | Disable line wrapping |
 | `-F`, `--follow` | Start in follow mode |
+| `--wordwrap` | Wrap lines at spaces and tabs (default) |
+| `--no-wordwrap` | Wrap lines at any character |
+| `--wrap-marker-space` | Add a space after the wrapped-line marker |
 | `--quit-if-one-screen` | Quit after printing if one known-size input fits one terminal page |
 | `-l`, `--line N` | Start at line N |
 | `-p`, `--pattern P` | Start with search pattern |
