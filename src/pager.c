@@ -4822,7 +4822,7 @@ static void print_usage(FILE *stream)
 		"      --wrap-marker-space\n"
 		"                    Add a space after the wrapped-line marker\n"
 		"      --quit-if-one-screen\n"
-		"                    Quit after printing if one known-size input fits one terminal page\n"
+		"                    Quit after printing if one input fits one terminal page\n"
 		"  -l, --line N      Start at line N\n"
 		"  -p, --pattern P   Start with search pattern\n"
 		"      --sync-output Enable synchronized output rendering\n"
@@ -4882,7 +4882,6 @@ int main(int argc, char **argv)
 	size_t start_line = 0;
 	char start_pattern[MAX_QUERY] = "";
 	bool has_start_pattern = false;
-	bool input_size_known = false;
 
 	init_default_key_bindings();
 	if (!args_request_generate_config(argc, argv))
@@ -4953,10 +4952,6 @@ int main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 
-		struct stat st;
-		if (fstat(STDIN_FILENO, &st) == 0 && S_ISREG(st.st_mode))
-			input_size_known = true;
-
 		source_is_stdin = true;
 		stdin_was_pipe = true;
 		follow_pipe_fd = dup(STDIN_FILENO);
@@ -4979,7 +4974,6 @@ int main(int argc, char **argv)
 			return EXIT_SUCCESS;
 
 		if (quit_if_one_screen
-			&& input_size_known
 			&& !follow_mode
 			&& input_fits_terminal_page()) {
 			write_buffer_to_terminal();
@@ -4992,12 +4986,6 @@ int main(int argc, char **argv)
 		if (buffer_size > 0 && is_probably_binary(buffer, buffer_size) && !prompt_binary_open("[stdin]"))
 			return EXIT_FAILURE;
 	} else {
-		if (file_count == 1) {
-			struct stat st;
-			if (stat(filenames[0], &st) == 0 && S_ISREG(st.st_mode))
-				input_size_known = true;
-		}
-
 		if (!switch_file(0, true))
 			return EXIT_FAILURE;
 	}
@@ -5006,7 +4994,6 @@ int main(int argc, char **argv)
 		return EXIT_SUCCESS;
 
 	if (quit_if_one_screen
-		&& input_size_known
 		&& file_count == 1
 		&& !follow_mode
 		&& input_fits_terminal_page()) {

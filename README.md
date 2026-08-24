@@ -153,5 +153,5 @@ or `"smart"` (case-insensitive unless the query has uppercase). Default is `"sma
 `command_popup_rows` controls the maximum number of command suggestions shown in
 the `:` popup (default `5`, max `32`).
 
-`quit_if_one_screen` enables less-style auto-quit behavior for a single known-size
-input that fits the current terminal page.
+`quit_if_one_screen` enables less-style auto-quit behavior for a single input that
+fits the current terminal page. Piped input is checked after it has been read to EOF.
