@@ -197,6 +197,7 @@ static bool running = true;
 
 static volatile sig_atomic_t term_resized = 0;
 static volatile sig_atomic_t got_sigcont = 0;
+static int signal_pipe[2] = { -1, -1 };
 
 static char status_flash[128] = "";
 static uint64_t status_flash_until = 0;
@@ -3387,24 +3388,46 @@ static enum key_code parse_csi_sequence(int first)
 	return KEY_ESC;
 }
 
-static int read_next_key_byte(int timeout_ms)
+static bool wait_for_key_event(int timeout_ms)
 {
-	struct pollfd pfd = {
-		.fd = STDIN_FILENO,
-		.events = POLLIN,
-		.revents = 0,
+	struct pollfd fds[2] = {
+		{
+			.fd = STDIN_FILENO,
+			.events = POLLIN,
+			.revents = 0,
+		},
+		{
+			.fd = signal_pipe[0],
+			.events = POLLIN,
+			.revents = 0,
+		},
 	};
+	nfds_t count = signal_pipe[0] >= 0 ? 2 : 1;
 
 	for (;;) {
-		int rc = poll(&pfd, 1, timeout_ms);
-		if (rc > 0)
-			break;
+		int rc = poll(fds, count, timeout_ms);
+		if (rc > 0) {
+			if (count > 1 && (fds[1].revents & POLLIN)) {
+				char pending[32];
+				while (read(signal_pipe[0], pending, sizeof(pending)) > 0)
+					;
+				return false;
+			}
+			if (fds[0].revents & (POLLIN | POLLHUP))
+				return true;
+		}
 		if (rc == 0)
-			return -1;
+			return false;
 		if (errno == EINTR)
 			continue;
-		return -1;
+		return false;
 	}
+}
+
+static int read_next_key_byte(int timeout_ms)
+{
+	if (!wait_for_key_event(timeout_ms))
+		return -1;
 
 	int c = GETC();
 	if (c == EOF) {
@@ -3420,6 +3443,9 @@ static int read_next_key_byte(int timeout_ms)
 
 static int read_key(void)
 {
+	if (!wait_for_key_event(-1))
+		return KEY_NONE;
+
 	int c = GETC();
 	if (c == EOF) {
 		if (errno == EINTR) {
@@ -3976,6 +4002,12 @@ static void handle_sigwinch(int sig)
 {
 	(void)sig;
 	term_resized = 1;
+	if (signal_pipe[1] >= 0) {
+		int saved_errno = errno;
+		char byte = 0;
+		(void)write(signal_pipe[1], &byte, 1);
+		errno = saved_errno;
+	}
 }
 
 static void restore_terminal_state(void)
@@ -3998,6 +4030,17 @@ static void cleanup(void)
 {
 	restore_terminal_state();
 
+	(void)signal(SIGWINCH, SIG_IGN);
+	(void)signal(SIGCONT, SIG_IGN);
+	if (signal_pipe[1] >= 0) {
+		close(signal_pipe[1]);
+		signal_pipe[1] = -1;
+	}
+	if (signal_pipe[0] >= 0) {
+		close(signal_pipe[0]);
+		signal_pipe[0] = -1;
+	}
+
 	if (follow_pipe_fd >= 0) {
 		close(follow_pipe_fd);
 		follow_pipe_fd = -1;
@@ -4018,6 +4061,12 @@ static void handle_sigcont(int sig)
 {
 	(void)sig;
 	got_sigcont = 1;
+	if (signal_pipe[1] >= 0) {
+		int saved_errno = errno;
+		char byte = 0;
+		(void)write(signal_pipe[1], &byte, 1);
+		errno = saved_errno;
+	}
 }
 
 static void enable_raw_mode(void)
@@ -4633,7 +4682,7 @@ static bool handle_key(int key)
 
 static bool follow_tick(int *key_out, bool *has_key)
 {
-	struct pollfd fds[2];
+	struct pollfd fds[3];
 	nfds_t count = 0;
 
 	fds[count].fd = STDIN_FILENO;
@@ -4648,6 +4697,14 @@ static bool follow_tick(int *key_out, bool *has_key)
 		count++;
 	}
 
+	int signal_idx = -1;
+	if (signal_pipe[0] >= 0) {
+		signal_idx = (int)count;
+		fds[count].fd = signal_pipe[0];
+		fds[count].events = POLLIN;
+		count++;
+	}
+
 	int rc = poll(fds, count, 250);
 	if (rc < 0) {
 		if (errno == EINTR)
@@ -4658,6 +4715,13 @@ static bool follow_tick(int *key_out, bool *has_key)
 	bool changed = false;
 
 	if (rc > 0) {
+		if (signal_idx >= 0 && (fds[signal_idx].revents & POLLIN)) {
+			char pending[32];
+			while (read(signal_pipe[0], pending, sizeof(pending)) > 0)
+				;
+			return false;
+		}
+
 		if (fds[0].revents & POLLIN) {
 			*key_out = read_key();
 			*has_key = true;
@@ -5012,6 +5076,8 @@ int main(int argc, char **argv)
 
 	if (signal(SIGINT, SIG_IGN) == SIG_ERR)
 		die("signal");
+	if (pipe2(signal_pipe, O_NONBLOCK | O_CLOEXEC) != 0)
+		die("pipe2");
 	if (signal(SIGWINCH, handle_sigwinch) == SIG_ERR)
 		die("signal");
 	if (signal(SIGTSTP, handle_sigtstp) == SIG_ERR)

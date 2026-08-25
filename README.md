@@ -12,6 +12,7 @@ Terminal pager for viewing files and command output, similar to `less`.
 - Search history
 - Line filtering by regex
 - Follow mode (like `tail -f`) for files and pipes
+- Live terminal resizing via `SIGWINCH`
 - Yank current line to clipboard via OSC 52
 - Command mode with autocompletion popup
 - Multi-file support with `:n` / `:p` and `]` / `[` navigation
