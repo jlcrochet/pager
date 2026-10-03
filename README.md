@@ -31,6 +31,8 @@ make install
 
 Installs to `~/.local/bin/`.
 
+Run regression tests with `make test`.
+
 ## Usage
 
 ```

@@ -18,6 +18,12 @@ install: $(BIN)
 	install -m 755 $(BIN) ~/.local/bin/
 
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) tests/test-pager
 
-.PHONY: all install clean
+tests/test-pager: tests/test_pager.c $(SRC) $(wildcard src/lib/*.h)
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+test: tests/test-pager
+	./tests/test-pager
+
+.PHONY: all install clean test

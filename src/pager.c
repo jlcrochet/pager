@@ -107,6 +107,8 @@ enum pager_action {
 static int read_key(void);
 static bool str_eq_ci(const char *a, const char *b);
 static void render_status_bar(void);
+static size_t rendered_rows_for_line(const char *line, size_t len);
+static bool view_line_screen_span(size_t target_view_idx, size_t *out_row_start, size_t *out_rows_visible);
 
 struct sgr_state {
 	char bytes[1024];
@@ -2354,6 +2356,30 @@ static bool raw_to_view_line(size_t raw_line, size_t *view_idx)
 	return false;
 }
 
+static size_t max_scroll_line(void)
+{
+	size_t count = view_line_count();
+	if (!wrap_mode)
+		return count > (size_t)content_rows ? count - (size_t)content_rows : 0;
+
+	/* Fill the last page using screen rows, including wrapped continuations. */
+	size_t first = count;
+	size_t remaining = (size_t)content_rows;
+	while (first > 0) {
+		size_t len = 0;
+		const char *line = get_line(view_to_raw_line(first - 1), &len);
+		size_t rows = rendered_rows_for_line(line, len);
+		if (rows > remaining) {
+			if (first == count)
+				first--;
+			break;
+		}
+		remaining -= rows;
+		first--;
+	}
+	return first;
+}
+
 static void clamp_scroll(void)
 {
 	size_t count = view_line_count();
@@ -2363,9 +2389,7 @@ static void clamp_scroll(void)
 		return;
 	}
 
-	size_t max_scroll = 0;
-	if (count > (size_t)content_rows)
-		max_scroll = count - (size_t)content_rows;
+	size_t max_scroll = max_scroll_line();
 
 	if (scroll_line > max_scroll)
 		scroll_line = max_scroll;
@@ -2467,7 +2491,7 @@ static void ensure_match_visible(size_t match_idx)
 
 	if (view_idx < scroll_line)
 		scroll_line = view_idx;
-	else if (view_idx >= scroll_line + (size_t)content_rows)
+	else if (!view_line_screen_span(view_idx, NULL, NULL))
 		scroll_line = view_idx;
 
 	clamp_scroll();
@@ -3055,9 +3079,17 @@ static void render_status_bar(void)
 {
 	size_t total = view_line_count();
 	size_t top = total > 0 ? scroll_line + 1 : 0;
-	size_t bottom = total > 0 ? scroll_line + (size_t)content_rows : 0;
-	if (bottom > total)
-		bottom = total;
+	size_t bottom = scroll_line;
+	size_t remaining = (size_t)content_rows;
+	while (bottom < total && remaining > 0) {
+		size_t len = 0;
+		const char *line = get_line(view_to_raw_line(bottom), &len);
+		size_t rows = rendered_rows_for_line(line, len);
+		bottom++;
+		if (rows >= remaining)
+			break;
+		remaining -= rows;
+	}
 
 	char source[512];
 	if (source_is_stdin) {
@@ -3535,16 +3567,7 @@ static bool go_to_line(size_t one_based)
 
 static void scroll_to_bottom(void)
 {
-	size_t count = view_line_count();
-	if (count == 0) {
-		scroll_line = 0;
-		return;
-	}
-
-	if (count <= (size_t)content_rows)
-		scroll_line = 0;
-	else
-		scroll_line = count - (size_t)content_rows;
+	scroll_line = max_scroll_line();
 }
 
 static void show_help_screen(void)
