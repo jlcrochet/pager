@@ -430,12 +430,13 @@ static void test_header_columns(void)
 	expect_unwrapped_line("ID  ");
 }
 
-static void expect_line_underline(void (*draw_line)(void), const char *expected, size_t underline_from)
+static void expect_line_underline(
+	void (*draw_line)(void), const char *expected, size_t underline_from, size_t underline_to)
 {
 	char out[2048];
 	capture_output(draw_line, out, sizeof(out));
 	bool underline = false;
-	size_t col = 0;
+	size_t col = 0, plain_pos = 0;
 	for (size_t pos = 0; out[pos];) {
 		if (out[pos] == '\x1b') {
 			size_t bytes = skip_ansi_sequence(out, pos, strlen(out));
@@ -448,11 +449,16 @@ static void expect_line_underline(void (*draw_line)(void), const char *expected,
 			pos += bytes;
 			continue;
 		}
-		assert(out[pos++] == expected[col]);
-		assert(underline == (col >= underline_from));
-		col++;
+		struct display_token token = next_display_token(out, strlen(out), pos, col);
+		assert(token.bytes <= strlen(expected) - plain_pos);
+		assert(memcmp(out + pos, expected + plain_pos, token.bytes) == 0);
+		for (size_t i = 0; i < token.width; i++)
+			assert(underline == (col + i >= underline_from && col + i < underline_to));
+		pos += token.bytes;
+		plain_pos += token.bytes;
+		col += token.width;
 	}
-	assert(col == strlen(expected));
+	assert(plain_pos == strlen(expected));
 	assert(!underline); /* The boundary style must not leak into subsequent rows. */
 }
 
@@ -465,42 +471,231 @@ static void test_floating_header_underline(void)
 {
 	set_input("\x1b[31mH\x1b[0mE\x1b[24mAD\none\ntwo\nthree\nfour\nfive\n");
 	assert(set_header("1", 0));
-	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX);
+	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX, SIZE_MAX);
 	assert(handle_navigation_action(ACTION_DOWN_LINE));
-	expect_line_underline(draw_first_unwrapped_line, "HEAD      ", 0);
+	expect_line_underline(draw_first_unwrapped_line, "HEAD", 0, 4);
 	find_all_matches("EA", false);
-	expect_line_underline(draw_first_unwrapped_line, "HEAD      ", 0);
+	expect_line_underline(draw_first_unwrapped_line, "HEAD", 0, 4);
 	show_line_numbers = true;
 	gutter_width = 2;
-	expect_line_underline(draw_first_unwrapped_line, "1 HEAD      ", 2);
+	expect_line_underline(draw_first_unwrapped_line, "1 HEAD", 2, 6);
 	show_line_numbers = false;
 	assert(handle_navigation_action(ACTION_TOP));
-	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX);
+	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX, SIZE_MAX);
 	assert(apply_filter("three|four|five", true));
 	assert(scroll_line == 0);
-	expect_line_underline(draw_first_unwrapped_line, "HEAD      ", 0);
+	expect_line_underline(draw_first_unwrapped_line, "HEAD", 0, 4);
 	clear_filter();
-	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX);
+	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX, SIZE_MAX);
 
 	assert(set_header("2", 0));
 	assert(handle_navigation_action(ACTION_DOWN_LINE));
-	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX);
-	expect_line_underline(draw_second_unwrapped_line, "one       ", 0);
+	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX, SIZE_MAX);
+	expect_line_underline(draw_second_unwrapped_line, "one ", 0, 4);
 	assert(set_header(",2", 0));
 	scroll_col = 1;
-	expect_line_underline(draw_second_unwrapped_line, "on        ", 0);
+	expect_line_underline(draw_second_unwrapped_line, "on ", 0, 3);
 	assert(set_header(",100", 0));
-	expect_line_underline(draw_second_unwrapped_line, "one       ", 0);
+	expect_line_underline(draw_second_unwrapped_line, "one       ", 0, 4);
 
 	set_input("\n1\n2\n3\n4\n");
 	assert(set_header("1", 0));
 	assert(handle_navigation_action(ACTION_DOWN_LINE));
-	expect_line_underline(draw_first_unwrapped_line, "          ", 0);
+	expect_line_underline(draw_first_unwrapped_line, "", SIZE_MAX, SIZE_MAX);
 	assert(set_header("-", 0));
-	expect_line_underline(draw_first_unwrapped_line, "", SIZE_MAX);
+	expect_line_underline(draw_first_unwrapped_line, "", SIZE_MAX, SIZE_MAX);
 	set_input("HEAD\n");
 	assert(set_header("1", 0));
-	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX);
+	expect_line_underline(draw_first_unwrapped_line, "HEAD", SIZE_MAX, SIZE_MAX);
+}
+
+static void test_header_underline_extent(void)
+{
+	set_input("\x1b[31m   TITLE\x1b[0m     \n x        \none\ntwo\nthree\n");
+	assert(set_header("2", 0));
+	expect_line_underline(draw_second_unwrapped_line, " x        ", SIZE_MAX, SIZE_MAX);
+	assert(handle_navigation_action(ACTION_DOWN_LINE));
+	assert(header_underline_cols() == 8);
+	expect_line_underline(draw_first_unwrapped_line, "   TITLE  ", SIZE_MAX, SIZE_MAX);
+	expect_line_underline(draw_second_unwrapped_line, " x        ", 0, 8);
+	find_all_matches("x +", false);
+	expect_line_underline(draw_second_unwrapped_line, " x        ", 0, 8);
+	assert(handle_navigation_action(ACTION_TOP));
+	expect_line_underline(draw_second_unwrapped_line, " x        ", SIZE_MAX, SIZE_MAX);
+
+	set_input("  HEAD   \n Longer  \none\ntwo\nthree\n");
+	assert(set_header("2", 0));
+	assert(handle_navigation_action(ACTION_DOWN_LINE));
+	expect_line_underline(draw_second_unwrapped_line, " Longer  ", 0, 7);
+	set_input("  HEAD   \n\none\ntwo\nthree\n");
+	assert(set_header("2", 0));
+	assert(handle_navigation_action(ACTION_DOWN_LINE));
+	expect_line_underline(draw_second_unwrapped_line, "      ", 0, 6);
+
+	/* The extent is clipped to the viewport and follows horizontal scrolling. */
+	set_input("abcdefghijklmnop   \nx   \none\ntwo\nthree\n");
+	assert(set_header("2", 0));
+	assert(handle_navigation_action(ACTION_DOWN_LINE));
+	expect_line_underline(draw_second_unwrapped_line, "x         ", 0, 10);
+	scroll_col = 9;
+	expect_line_underline(draw_second_unwrapped_line, "       ", 0, 7);
+	assert(set_header(",2", 0));
+	expect_line_underline(draw_second_unwrapped_line, "x      ", 0, 7);
+	scroll_col = 100;
+	expect_line_underline(draw_second_unwrapped_line, "x ", 0, 2);
+
+	/* An endpoint can fall inside a tab on the final header row. */
+	set_input("abc   \n\t   \none\ntwo\nthree\n");
+	assert(set_header("2", 0));
+	assert(handle_navigation_action(ACTION_DOWN_LINE));
+	expect_line_underline(draw_second_unwrapped_line, "          ", 0, 3);
+	set_input("  \t  \n\t  \none\ntwo\nthree\n");
+	assert(set_header("2", 0));
+	assert(handle_navigation_action(ACTION_DOWN_LINE));
+	expect_line_underline(draw_second_unwrapped_line, "          ", SIZE_MAX, SIZE_MAX);
+
+	set_input("  界é\u2003\t\n X  \none\ntwo\nthree\n");
+	assert(set_header("2", 0));
+	assert(handle_navigation_action(ACTION_DOWN_LINE));
+	expect_line_underline(draw_second_unwrapped_line, " X   ", 0, 5);
+	set_input("abcde  \n 界  \none\ntwo\nthree\n");
+	assert(set_header("2", 0));
+	assert(handle_navigation_action(ACTION_DOWN_LINE));
+	expect_line_underline(draw_second_unwrapped_line, " 界  ", 0, 5);
+}
+
+static void test_scaled_navigation(void)
+{
+	assert(horizontal_scale == 1 && vertical_scale == 1);
+	set_input("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n");
+	assert(handle_navigation_action(ACTION_DOWN_SCALED) && scroll_line == 1);
+	assert(handle_navigation_action(ACTION_UP_SCALED) && scroll_line == 0);
+	assert(!handle_navigation_action(ACTION_LEFT_SCALED));
+	assert(!handle_navigation_action(ACTION_RIGHT_SCALED));
+	wrap_mode = false;
+	assert(handle_navigation_action(ACTION_RIGHT_SCALED) && scroll_col == 1);
+	assert(handle_navigation_action(ACTION_LEFT_SCALED) && scroll_col == 0);
+
+	vertical_scale = 3;
+	assert(handle_navigation_action(ACTION_RIGHT_SCALED) && scroll_col == 1);
+	assert(handle_navigation_action(ACTION_LEFT_SCALED) && scroll_col == 0);
+	horizontal_scale = 5;
+	assert(handle_navigation_action(ACTION_DOWN_SCALED) && scroll_line == 3);
+	assert(handle_navigation_action(ACTION_DOWN_SCALED) && scroll_line == 6);
+	assert(handle_navigation_action(ACTION_DOWN_SCALED) && scroll_line == 8);
+	assert(!handle_navigation_action(ACTION_DOWN_SCALED));
+	assert(handle_navigation_action(ACTION_UP_SCALED) && scroll_line == 5);
+	assert(handle_navigation_action(ACTION_UP_SCALED) && scroll_line == 2);
+	assert(handle_navigation_action(ACTION_UP_SCALED) && scroll_line == 0);
+	assert(!handle_navigation_action(ACTION_UP_SCALED));
+	assert(handle_navigation_action(ACTION_RIGHT_SCALED) && scroll_col == 5);
+	assert(handle_navigation_action(ACTION_RIGHT_SCALED) && scroll_col == 10);
+	assert(handle_navigation_action(ACTION_LEFT_SCALED) && scroll_col == 5);
+	scroll_col = 2;
+	assert(handle_navigation_action(ACTION_LEFT_SCALED) && scroll_col == 0);
+	assert(!handle_navigation_action(ACTION_LEFT_SCALED));
+
+	/* Existing actions retain their step sizes even with non-default scales. */
+	assert(handle_navigation_action(ACTION_DOWN_LINE) && scroll_line == 1);
+	assert(handle_navigation_action(ACTION_UP_LINE) && scroll_line == 0);
+	assert(handle_navigation_action(ACTION_SCROLL_RIGHT) && scroll_col == 1);
+	assert(handle_navigation_action(ACTION_SCROLL_LEFT) && scroll_col == 0);
+	assert(handle_navigation_action(ACTION_MOUSE_SCROLL_DOWN) && scroll_line == 3);
+	assert(handle_navigation_action(ACTION_MOUSE_SCROLL_UP) && scroll_line == 0);
+	assert(handle_navigation_action(ACTION_PAGE_DOWN) && scroll_line == 4);
+	assert(handle_navigation_action(ACTION_PAGE_UP) && scroll_line == 0);
+	assert(handle_navigation_action(ACTION_HALF_PAGE_DOWN) && scroll_line == 2);
+	assert(handle_navigation_action(ACTION_HALF_PAGE_UP) && scroll_line == 0);
+
+	/* Large steps saturate instead of overflowing or underflowing. */
+	horizontal_scale = vertical_scale = SIZE_MAX;
+	scroll_line = 1;
+	assert(handle_navigation_action(ACTION_DOWN_SCALED) && scroll_line == 8);
+	assert(handle_navigation_action(ACTION_UP_SCALED) && scroll_line == 0);
+	scroll_col = 1;
+	assert(handle_navigation_action(ACTION_RIGHT_SCALED) && scroll_col == SIZE_MAX);
+	assert(!handle_navigation_action(ACTION_RIGHT_SCALED));
+	assert(handle_navigation_action(ACTION_LEFT_SCALED) && scroll_col == 0);
+
+	set_input("");
+	assert(!handle_navigation_action(ACTION_DOWN_SCALED));
+	assert(!handle_navigation_action(ACTION_UP_SCALED));
+	assert(!handle_navigation_action(ACTION_LEFT_SCALED));
+	assert(!handle_navigation_action(ACTION_RIGHT_SCALED));
+	horizontal_scale = vertical_scale = 1;
+}
+
+static void apply_test_config(enum config_section section, const char *key, const char *value)
+{
+	size_t start_line = 1;
+	char start_pattern[MAX_QUERY] = "";
+	bool has_start_pattern = false;
+	apply_config_kv("test.toml", 1, section, key, value,
+		&start_line, start_pattern, &has_start_pattern);
+}
+
+static void apply_invalid_scales(void)
+{
+	const char *values[] = { "0", "-1", "1.5", "true", "\"3\"", "18446744073709551616" };
+	for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+		apply_test_config(CONFIG_SECTION_ROOT, "horizontal_scale", values[i]);
+		apply_test_config(CONFIG_SECTION_ROOT, "vertical_scale", values[i]);
+		assert(horizontal_scale == 5 && vertical_scale == 3);
+	}
+}
+
+static void test_scaled_config_and_bindings(void)
+{
+	init_default_key_bindings();
+	assert(action_for_key(KEY_DOWN) == ACTION_DOWN_SCALED);
+	assert(action_for_key(KEY_UP) == ACTION_UP_SCALED);
+	assert(action_for_key(KEY_LEFT) == ACTION_LEFT_SCALED);
+	assert(action_for_key(KEY_RIGHT) == ACTION_RIGHT_SCALED);
+	assert(action_for_key('h') == ACTION_SCROLL_LEFT);
+	assert(action_for_key('l') == ACTION_SCROLL_RIGHT);
+	assert(key_bindings[ACTION_SHOW_HELP].count == 0);
+
+	apply_test_config(CONFIG_SECTION_ROOT, "horizontal_scale", "5");
+	assert(horizontal_scale == 5 && vertical_scale == 1);
+	apply_test_config(CONFIG_SECTION_ROOT, "vertical_scale", "3");
+	assert(horizontal_scale == 5 && vertical_scale == 3);
+	char out[1024];
+	capture_output(apply_invalid_scales, out, sizeof(out));
+	assert(strstr(out, "invalid positive integer for horizontal_scale"));
+	assert(strstr(out, "invalid positive integer for vertical_scale"));
+	char max_scale[32];
+	snprintf(max_scale, sizeof(max_scale), "%zu", SIZE_MAX);
+	apply_test_config(CONFIG_SECTION_ROOT, "horizontal_scale", max_scale);
+	assert(horizontal_scale == SIZE_MAX && vertical_scale == 3);
+	apply_test_config(CONFIG_SECTION_ROOT, "horizontal_scale", "5");
+	apply_test_config(CONFIG_SECTION_ROOT, "vertical_scale", max_scale);
+	assert(horizontal_scale == 5 && vertical_scale == SIZE_MAX);
+	apply_test_config(CONFIG_SECTION_ROOT, "vertical_scale", "3");
+
+	set_input("0\n1\n2\n3\n4\n5\n6\n7\n");
+	wrap_mode = false;
+	assert(handle_key(KEY_DOWN) && scroll_line == 3);
+	assert(handle_key(KEY_UP) && scroll_line == 0);
+	assert(handle_key(KEY_RIGHT) && scroll_col == 5);
+	assert(handle_key(KEY_LEFT) && scroll_col == 0);
+	assert(handle_key('l') && scroll_col == 1);
+	assert(handle_key('h') && scroll_col == 0);
+	assert(handle_key('j') && scroll_line == 1);
+	assert(handle_key('k') && scroll_line == 0);
+	assert(handle_key('\n') && scroll_line == 1);
+	scroll_line = 0;
+
+	/* The scaled actions can also be assigned to other keys. */
+	apply_test_config(CONFIG_SECTION_KEYBINDINGS, "down_scaled", "[\"J\"]");
+	apply_test_config(CONFIG_SECTION_KEYBINDINGS, "up_scaled", "[\"K\"]");
+	apply_test_config(CONFIG_SECTION_KEYBINDINGS, "left_scaled", "[\"H\"]");
+	apply_test_config(CONFIG_SECTION_KEYBINDINGS, "right_scaled", "[\"L\"]");
+	assert(handle_key('J') && scroll_line == 3);
+	assert(handle_key('K') && scroll_line == 0);
+	assert(handle_key('L') && scroll_col == 5);
+	assert(handle_key('H') && scroll_col == 0);
+	horizontal_scale = vertical_scale = 1;
+	init_default_key_bindings();
 }
 
 int main(void)
@@ -516,6 +711,9 @@ int main(void)
 	test_header_scrolling_and_search();
 	test_header_columns();
 	test_floating_header_underline();
+	test_header_underline_extent();
+	test_scaled_navigation();
+	test_scaled_config_and_bindings();
 	clear_content();
 	puts("pager regression tests passed");
 	return 0;

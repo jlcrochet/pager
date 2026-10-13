@@ -90,6 +90,10 @@ enum pager_action {
 	ACTION_BOTTOM,
 	ACTION_SCROLL_LEFT,
 	ACTION_SCROLL_RIGHT,
+	ACTION_DOWN_SCALED,
+	ACTION_UP_SCALED,
+	ACTION_LEFT_SCALED,
+	ACTION_RIGHT_SCALED,
 	ACTION_MOUSE_SCROLL_UP,
 	ACTION_MOUSE_SCROLL_DOWN,
 	ACTION_TOGGLE_WRAP,
@@ -183,6 +187,8 @@ static int gutter_width = 0;
 
 static size_t scroll_line = 0;
 static size_t scroll_col = 0;
+static size_t horizontal_scale = 1;
+static size_t vertical_scale = 1;
 static size_t header_lines = 0;
 static size_t header_cols = 0;
 static size_t header_start = 0;
@@ -839,12 +845,12 @@ static void init_default_key_bindings(void)
 	(void)bind_key_to_action(ACTION_QUIT, 'q');
 
 	(void)bind_key_to_action(ACTION_DOWN_LINE, 'j');
-	(void)bind_key_to_action(ACTION_DOWN_LINE, KEY_DOWN);
+	(void)bind_key_to_action(ACTION_DOWN_SCALED, KEY_DOWN);
 	(void)bind_key_to_action(ACTION_DOWN_LINE, '\n');
 	(void)bind_key_to_action(ACTION_DOWN_LINE, '\r');
 
 	(void)bind_key_to_action(ACTION_UP_LINE, 'k');
-	(void)bind_key_to_action(ACTION_UP_LINE, KEY_UP);
+	(void)bind_key_to_action(ACTION_UP_SCALED, KEY_UP);
 
 	(void)bind_key_to_action(ACTION_PAGE_DOWN, ' ');
 	(void)bind_key_to_action(ACTION_PAGE_DOWN, KEY_PGDN);
@@ -861,8 +867,10 @@ static void init_default_key_bindings(void)
 	(void)bind_key_to_action(ACTION_BOTTOM, 'G');
 	(void)bind_key_to_action(ACTION_BOTTOM, KEY_END);
 
-	(void)bind_key_to_action(ACTION_SCROLL_LEFT, KEY_LEFT);
-	(void)bind_key_to_action(ACTION_SCROLL_RIGHT, KEY_RIGHT);
+	(void)bind_key_to_action(ACTION_LEFT_SCALED, KEY_LEFT);
+	(void)bind_key_to_action(ACTION_RIGHT_SCALED, KEY_RIGHT);
+	(void)bind_key_to_action(ACTION_SCROLL_LEFT, 'h');
+	(void)bind_key_to_action(ACTION_SCROLL_RIGHT, 'l');
 
 	(void)bind_key_to_action(ACTION_MOUSE_SCROLL_UP, KEY_MOUSE_UP);
 	(void)bind_key_to_action(ACTION_MOUSE_SCROLL_DOWN, KEY_MOUSE_DOWN);
@@ -877,7 +885,6 @@ static void init_default_key_bindings(void)
 	(void)bind_key_to_action(ACTION_COMMAND_PROMPT, ':');
 	(void)bind_key_to_action(ACTION_FOLLOW_MODE, 'F');
 	(void)bind_key_to_action(ACTION_YANK_LINE, 'y');
-	(void)bind_key_to_action(ACTION_SHOW_HELP, 'h');
 }
 
 static bool parse_binding_key_name(const char *name, int *out_key)
@@ -1032,6 +1039,22 @@ static bool parse_binding_action(const char *name, enum pager_action *out_action
 	}
 	if (str_eq_ci(name, "right")) {
 		*out_action = ACTION_SCROLL_RIGHT;
+		return true;
+	}
+	if (str_eq_ci(name, "down_scaled")) {
+		*out_action = ACTION_DOWN_SCALED;
+		return true;
+	}
+	if (str_eq_ci(name, "up_scaled")) {
+		*out_action = ACTION_UP_SCALED;
+		return true;
+	}
+	if (str_eq_ci(name, "left_scaled")) {
+		*out_action = ACTION_LEFT_SCALED;
+		return true;
+	}
+	if (str_eq_ci(name, "right_scaled")) {
+		*out_action = ACTION_RIGHT_SCALED;
 		return true;
 	}
 	if (str_eq_ci(name, "mouse_up")) {
@@ -1349,6 +1372,19 @@ static void apply_config_kv(
 	if (section != CONFIG_SECTION_ROOT)
 		return;
 
+	if (strcmp(key, "horizontal_scale") == 0 || strcmp(key, "vertical_scale") == 0) {
+		size_t n = 0;
+		if (!parse_toml_size(value, &n)) {
+			fprintf(stderr, "pager: %s:%zu invalid positive integer for %s\n", path, line_no, key);
+			return;
+		}
+		if (strcmp(key, "horizontal_scale") == 0)
+			horizontal_scale = n;
+		else
+			vertical_scale = n;
+		return;
+	}
+
 	if (strcmp(key, "number") == 0) {
 		bool b = false;
 		if (!parse_toml_bool(value, &b)) {
@@ -1557,6 +1593,8 @@ static bool write_generated_config(FILE *fp)
 		"# Root keys (global options). Uncomment to override defaults.\n"
 		"# number = false\n"
 		"# wrap = true\n"
+		"# horizontal_scale = 1  # positive integer; step for left_scaled/right_scaled\n"
+		"# vertical_scale = 1  # positive integer; step for down_scaled/up_scaled\n"
 		"# follow = false\n"
 		"# line = 1\n"
 		"# pattern = \"\"\n"
@@ -1573,16 +1611,20 @@ static bool write_generated_config(FILE *fp)
 		"# Defining a key here moves it from any previous action.\n"
 		"[keybindings]\n"
 		"# quit = [\"q\"]\n"
-		"# down = [\"j\", \"down\", \"enter\", \"ctrl-j\"]\n"
-		"# up = [\"k\", \"up\"]\n"
+		"# down = [\"j\", \"enter\", \"ctrl-j\"]\n"
+		"# up = [\"k\"]\n"
 		"# page_down = [\"space\", \"pgdn\"]\n"
 		"# page_up = [\"b\", \"pgup\"]\n"
 		"# half_page_down = [\"d\"]\n"
 		"# half_page_up = [\"u\"]\n"
 		"# top = [\"g\", \"home\"]\n"
 		"# bottom = [\"G\", \"end\"]\n"
-		"# left = [\"left\"]\n"
-		"# right = [\"right\"]\n"
+		"# left = [\"h\"]\n"
+		"# right = [\"l\"]\n"
+		"# down_scaled = [\"down\"]\n"
+		"# up_scaled = [\"up\"]\n"
+		"# left_scaled = [\"left\"]\n"
+		"# right_scaled = [\"right\"]\n"
 		"# mouse_up = [\"mouse-up\"]\n"
 		"# mouse_down = [\"mouse-down\"]\n"
 		"# wrap = [\"w\"]\n"
@@ -1595,7 +1637,7 @@ static bool write_generated_config(FILE *fp)
 		"# command = [\":\"]\n"
 		"# follow = [\"F\"]\n"
 		"# yank = [\"y\"]\n"
-		"# help = [\"h\"]\n") < 0)
+		"# help = []\n") < 0)
 		return false;
 
 	return true;
@@ -2970,6 +3012,36 @@ static bool header_row_floats(size_t raw_line)
 		&& view_line_count() > 0 && view_to_raw_line(scroll_line) > raw_line + 1;
 }
 
+static size_t header_underline_cols(void)
+{
+	size_t end = 0;
+	for (size_t raw = header_start; raw < header_end(); raw++) {
+		size_t len = 0, pos = 0, col = 0;
+		const char *line = get_line(raw, &len);
+		while (pos < len) {
+			struct display_token token = next_display_token(line, len, pos, col);
+			if (!token.ansi) {
+				col += token.width;
+				uint32_t cp = utf8_decode((const unsigned char *)line + pos, len - pos, NULL);
+				if (token.width > 0 && !wrap_space_char(cp) && col > end)
+					end = col;
+			}
+			pos += token.bytes;
+		}
+	}
+
+	/* Map the right edge through fixed columns and horizontal scrolling. */
+	size_t cols = (size_t)content_cols;
+	size_t fixed = header_cols < cols ? header_cols : cols;
+	size_t visible = end < fixed ? end : fixed;
+	size_t start = scroll_col > SIZE_MAX - fixed ? SIZE_MAX : fixed + scroll_col;
+	if (end > start) {
+		size_t width = end - start;
+		visible = fixed + (width < cols - fixed ? width : cols - fixed);
+	}
+	return visible;
+}
+
 static void draw_gutter(size_t raw_line, bool continuation)
 {
 	if (!show_line_numbers)
@@ -3010,9 +3082,24 @@ static void draw_wrap_prefix(void)
 	PUTS_ERR(SGR_RESET);
 }
 
+static void apply_slice_underline(
+	bool underline, bool *was_underlined, const struct sgr_state *sgr,
+	bool highlight_on, bool current_highlight)
+{
+	if (*was_underlined && !underline) {
+		PUTS_ERR(SGR_RESET);
+		emit_sgr_state(sgr);
+		if (highlight_on)
+			PUTS_ERR(current_highlight ? search_current_match_sgr : search_other_match_sgr);
+	}
+	if (underline)
+		PUTS_ERR(SGR_UNDERSCORE_ON);
+	*was_underlined = underline;
+}
+
 static size_t render_line_slice(
 	const char *line, size_t len, size_t start_col, size_t max_cols, size_t raw_line,
-	bool underline)
+	size_t underline_cols)
 {
 	struct sgr_state sgr;
 	size_t plain_pos = 0;
@@ -3036,6 +3123,7 @@ static size_t render_line_slice(
 	size_t out_cols = 0;
 	bool highlight_on = false;
 	bool current_highlight = false;
+	bool boundary_underline_on = false;
 
 	while (pos < len && out_cols < max_cols) {
 		struct display_token token = next_display_token(line, len, pos, logical_col);
@@ -3086,12 +3174,15 @@ static size_t render_line_slice(
 		}
 
 		/* Input SGR resets and search styles must not erase the header boundary. */
-		if (underline)
-			PUTS_ERR(SGR_UNDERSCORE_ON);
 		if (token.tab || partial) {
-			for (size_t i = 0; i < visible_cols; i++)
+			for (size_t i = 0; i < visible_cols; i++) {
+				apply_slice_underline(out_cols + i < underline_cols,
+					&boundary_underline_on, &sgr, highlight_on, current_highlight);
 				PUTC_ERR(' ');
+			}
 		} else {
+			apply_slice_underline(out_cols < underline_cols,
+				&boundary_underline_on, &sgr, highlight_on, current_highlight);
 			WRITE_ERR(line + pos, token.bytes);
 		}
 
@@ -3116,32 +3207,40 @@ static void finish_line_slice(size_t rendered_cols, size_t max_cols)
 		PUTS_ERR(ERASE_TO_EOL);
 }
 
+static void pad_line_slice(size_t rendered, size_t target, size_t underline_cols)
+{
+	PUTS_ERR(SGR_RESET);
+	if (rendered < underline_cols)
+		PUTS_ERR(SGR_UNDERSCORE_ON);
+	for (size_t col = rendered; col < target; col++) {
+		if (col == underline_cols)
+			PUTS_ERR(SGR_UNDERLINE_OFF);
+		PUTC_ERR(' ');
+	}
+	PUTS_ERR(SGR_RESET);
+}
+
 static void draw_unwrapped_line(size_t raw_line)
 {
 	size_t len = 0;
 	const char *line = get_line(raw_line, &len);
 	draw_gutter(raw_line, false);
-	bool underline = header_row_floats(raw_line);
+	size_t underline_cols = header_row_floats(raw_line) ? header_underline_cols() : 0;
 	size_t cols = (size_t)content_cols;
 	size_t fixed = header_cols < cols ? header_cols : cols;
 	if (fixed > 0) {
-		size_t rendered = render_line_slice(line, len, 0, fixed, raw_line, underline);
-		PUTS_ERR(SGR_RESET);
-		if (underline)
-			PUTS_ERR(SGR_UNDERSCORE_ON);
-		for (size_t i = rendered; i < fixed; i++)
-			PUTC_ERR(' ');
+		size_t fixed_underline = underline_cols < fixed ? underline_cols : fixed;
+		size_t rendered = render_line_slice(line, len, 0, fixed, raw_line, fixed_underline);
+		pad_line_slice(rendered, fixed, fixed_underline);
 	}
 	size_t start = scroll_col > SIZE_MAX - fixed ? SIZE_MAX : fixed + scroll_col;
-	size_t rendered = render_line_slice(line, len, start, cols - fixed, raw_line, underline);
-	if (underline) {
-		PUTS_ERR(SGR_RESET SGR_UNDERSCORE_ON);
-		for (size_t i = rendered; i < cols - fixed; i++)
-			PUTC_ERR(' ');
-		PUTS_ERR(SGR_RESET);
-	} else {
-		finish_line_slice(rendered, cols - fixed);
+	size_t body_underline = underline_cols > fixed ? underline_cols - fixed : 0;
+	size_t rendered = render_line_slice(line, len, start, cols - fixed, raw_line, body_underline);
+	if (rendered < body_underline) {
+		pad_line_slice(rendered, body_underline, body_underline);
+		rendered = body_underline;
 	}
+	finish_line_slice(rendered, cols - fixed);
 }
 
 static size_t rendered_rows_for_line(const char *line, size_t len)
@@ -3236,7 +3335,7 @@ static void redraw_visible_view_line(size_t view_idx)
 
 		struct wrap_slice slice = wrapped_slice(line, line_len, start_col, line_cols);
 		size_t rendered_cols = render_line_slice(
-			line, line_len, start_col, slice.render_cols, raw_line, false);
+			line, line_len, start_col, slice.render_cols, raw_line, 0);
 		finish_line_slice(rendered_cols, line_cols);
 
 		start_col += slice.advance_cols;
@@ -3427,7 +3526,7 @@ static void render_frame(bool include_status_bar)
 
 					struct wrap_slice slice = wrapped_slice(line, len, start_col, line_cols);
 					size_t rendered_cols = render_line_slice(
-						line, len, start_col, slice.render_cols, raw_line, false);
+						line, len, start_col, slice.render_cols, raw_line, 0);
 
 					finish_line_slice(rendered_cols, line_cols);
 					if (row < content_rows)
@@ -3795,14 +3894,16 @@ static void show_help_screen(void)
 		"pager key bindings\n"
 		"\n"
 		"  q                 quit\n"
-		"  j / Down / Enter  down one line\n"
-		"  k / Up            up one line\n"
+		"  j / Enter         down one line\n"
+		"  k                 up one line\n"
+		"  Down / Up         down/up by vertical_scale lines\n"
 		"  Space / PgDn      page down\n"
 		"  b / PgUp          page up\n"
 		"  d / u             half page down/up\n"
 		"  g / Home          top\n"
 		"  G / End           bottom\n"
-		"  Left / Right      horizontal scroll in nowrap\n"
+		"  Left / Right      left/right by horizontal_scale columns in nowrap\n"
+		"  h / l             left/right one column in nowrap\n"
 		"  w                 toggle wrap\n"
 		"  / ?               incremental search forward/backward\n"
 		"  n / N             next/previous match\n"
@@ -3815,6 +3916,8 @@ static void show_help_screen(void)
 		"Commands: :q :123 :wrap :nowrap :number :nonumber :sync :nosync\n"
 		"          :filter <pattern> :header L[,C[,N]] :header - :n :p :follow :help\n"
 		"Config:   [keybindings]\n"
+		"          down_scaled/up_scaled use vertical_scale (default 1)\n"
+		"          left_scaled/right_scaled use horizontal_scale (default 1)\n"
 		"\n"
 		"Press any key to return..."
 	);
@@ -4738,7 +4841,8 @@ static void open_search_prompt(bool backward)
 static bool handle_navigation_action(enum pager_action action)
 {
 	size_t count = view_line_count();
-	if (count == 0 && action != ACTION_SCROLL_LEFT && action != ACTION_SCROLL_RIGHT)
+	if (count == 0 && action != ACTION_SCROLL_LEFT && action != ACTION_SCROLL_RIGHT
+		&& action != ACTION_LEFT_SCALED && action != ACTION_RIGHT_SCALED)
 		return false;
 
 	size_t page_rows = body_screen_rows();
@@ -4758,6 +4862,14 @@ static bool handle_navigation_action(enum pager_action action)
 		case ACTION_UP_LINE:
 			if (scroll_line > 0)
 				scroll_line--;
+			break;
+
+		case ACTION_DOWN_SCALED:
+			scroll_line = vertical_scale > SIZE_MAX - scroll_line ? SIZE_MAX : scroll_line + vertical_scale;
+			break;
+
+		case ACTION_UP_SCALED:
+			scroll_line = scroll_line > vertical_scale ? scroll_line - vertical_scale : 0;
 			break;
 
 		case ACTION_PAGE_DOWN:
@@ -4798,6 +4910,16 @@ static bool handle_navigation_action(enum pager_action action)
 		case ACTION_SCROLL_RIGHT:
 			if (!lines_wrap() && scroll_col < SIZE_MAX)
 				scroll_col++;
+			break;
+
+		case ACTION_LEFT_SCALED:
+			if (!lines_wrap())
+				scroll_col = scroll_col > horizontal_scale ? scroll_col - horizontal_scale : 0;
+			break;
+
+		case ACTION_RIGHT_SCALED:
+			if (!lines_wrap())
+				scroll_col = horizontal_scale > SIZE_MAX - scroll_col ? SIZE_MAX : scroll_col + horizontal_scale;
 			break;
 
 		case ACTION_MOUSE_SCROLL_UP:
@@ -4929,6 +5051,10 @@ static bool handle_key(int key)
 		case ACTION_BOTTOM:
 		case ACTION_SCROLL_LEFT:
 		case ACTION_SCROLL_RIGHT:
+		case ACTION_DOWN_SCALED:
+		case ACTION_UP_SCALED:
+		case ACTION_LEFT_SCALED:
+		case ACTION_RIGHT_SCALED:
 		case ACTION_MOUSE_SCROLL_UP:
 		case ACTION_MOUSE_SCROLL_DOWN:
 			return handle_navigation_action(action);
@@ -5106,6 +5232,8 @@ static void print_usage(FILE *stream)
 		"  Root keys (global options):\n"
 		"    number = true|false\n"
 		"    wrap = true|false\n"
+		"    horizontal_scale = <positive integer, default 1>\n"
+		"    vertical_scale = <positive integer, default 1>\n"
 		"    follow = true|false\n"
 		"    line = <positive integer>\n"
 		"    pattern = \"search text\"\n"
@@ -5124,6 +5252,7 @@ static void print_usage(FILE *stream)
 		"  Keybinding actions:\n"
 		"    quit down up page_down page_up half_page_down half_page_up\n"
 		"    top bottom left right wrap search_forward search_backward\n"
+		"    down_scaled up_scaled left_scaled right_scaled\n"
 		"    next_match prev_match next_file prev_file command follow yank help\n"
 		"\n"
 		"  Example:\n"

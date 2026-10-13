@@ -81,7 +81,8 @@ fixed when scrolling horizontally. `--header=2,0,3` uses lines 3 and 4 as the he
 lines before the header are hidden. Header columns do not include the line-number
 gutter.
 When scrolling separates the header from the following input line, its last row
-is underlined across the text area to show that it is floating. The underline
+is underlined from the first text column through the rightmost non-whitespace
+column across all header lines, including blank cells within that span. The underline
 disappears when the body returns to the line immediately after the header.
 
 Like `less`, active headers truncate long lines and allow horizontal scrolling,
@@ -95,14 +96,16 @@ the available height, leaving at least one row for the body.
 | Key | Action |
 |-----|--------|
 | `q` | Quit |
-| `j` / Down / Enter | Down one line |
-| `k` / Up | Up one line |
+| `j` / Enter | Down one line |
+| `k` | Up one line |
+| Down / Up | Down / up by `vertical_scale` lines |
 | Space / PgDn | Page down |
 | `b` / PgUp | Page up |
 | `d` / `u` | Half page down / up |
 | `g` / Home | Go to top |
 | `G` / End | Go to bottom |
-| Left / Right | Horizontal scroll (when wrapping is off) |
+| Left / Right | Left / right by `horizontal_scale` columns (when wrapping is off) |
+| `h` / `l` | Left / right one column (when wrapping is off) |
 | `w` | Toggle line wrapping |
 | `/` | Search forward |
 | `?` | Search backward |
@@ -112,7 +115,6 @@ the available height, leaving at least one row for the body.
 | `F` | Enter follow mode |
 | `y` | Yank current line to clipboard |
 | `:` | Open command prompt |
-| `h` | Show help |
 
 ## Commands
 
@@ -148,6 +150,8 @@ Example config:
 
 ```toml
 wrap = true
+horizontal_scale = 1
+vertical_scale = 1
 number = false
 search_regex = true
 search_wrap = true
@@ -160,8 +164,14 @@ quit_if_one_screen = false
 
 [keybindings]
 quit = ["q"]
-down = ["j", "down", "enter"]
-up = ["k", "up"]
+down = ["j", "enter"]
+up = ["k"]
+down_scaled = ["down"]
+up_scaled = ["up"]
+left_scaled = ["left"]
+right_scaled = ["right"]
+left = ["h"]
+right = ["l"]
 page_down = ["space", "pgdn"]
 page_up = ["b", "pgup"]
 half_page_down = ["d"]
@@ -177,8 +187,24 @@ prev_file = ["["]
 follow = ["F"]
 yank = ["y"]
 command = [":"]
-help = ["h"]
+help = []
 ```
+
+`vertical_scale` sets the number of lines moved by `down_scaled` and `up_scaled`.
+`horizontal_scale` sets the number of columns moved by `left_scaled` and
+`right_scaled`. Both default to `1` and accept positive integers.
+The arrow keys are bound to these actions by default. Horizontal scaled scrolling
+requires wrapping to be off, just like `left` and `right`.
+
+For example, to make Up/Down scroll by three lines and Left/Right by five columns:
+
+```toml
+horizontal_scale = 5
+vertical_scale = 3
+```
+
+The existing `down`, `up`, `left`, and `right` actions still move by one, and mouse
+scrolling still moves by three lines.
 
 `search_current_match_sgr` and `search_other_match_sgr` accept either numeric SGR
 codes (for example `7;33`) or common aliases (for example `reversed yellow`,
