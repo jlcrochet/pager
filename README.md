@@ -6,6 +6,7 @@ Terminal pager for viewing files and command output, similar to `less`.
 
 - Line wrapping (on by default, togglable)
 - Line numbers
+- Fixed header lines and columns (`--header`, like `less`)
 - Regex search with match highlighting (forward and backward)
 - Incremental search while typing (`/` and `?`)
 - Configurable search case mode (`false` insensitive, `true` sensitive, `"smart"` smart-case)
@@ -47,16 +48,47 @@ command | pager
 | `-N`, `--number` | Show line numbers |
 | `-S`, `--nowrap` | Disable line wrapping |
 | `-F`, `--follow` | Start in follow mode |
-| `--wordwrap` | Wrap lines at spaces and tabs (default) |
+| `--wordwrap` | Prefer whole big words, then little-word boundaries (default) |
 | `--no-wordwrap` | Wrap lines at any character |
-| `--wrap-marker-space` | Add a space after the wrapped-line marker |
+| `--wrap-marker-space` | Add a space after the wrapped-line marker (default) |
+| `--no-wrap-marker-space` | Omit the space after the wrapped-line marker |
 | `--quit-if-one-screen` | Quit after printing if one known-size input fits one terminal page |
+| `--header L[,C[,N]]` | Keep L lines and C columns fixed, starting at line N (default 1) |
 | `-l`, `--line N` | Start at line N |
 | `-p`, `--pattern P` | Start with search pattern |
 | `--sync-output` | Enable synchronized output rendering |
 | `--no-sync-output` | Disable synchronized output rendering |
 | `--generate-config[=PATH]` | Write a default config template |
 | `-h`, `--help` | Show help |
+
+Wrapping is enabled by default (`wrap = true` in the config). Word wrapping first
+tries to keep each run of non-whitespace characters together, including URLs,
+paths, and punctuation. If a run cannot fit on a continuation row, it prefers
+breaks after punctuation to keep runs of letters, digits, and `_` together. If
+those runs are also too long, it fills the row before splitting them. Unicode
+letters and digits count as word characters.
+
+Trailing whitespace stays with the preceding text. Whitespace extending past the
+edge is consumed without starting a continuation with extra spaces or tabs;
+the input itself is unchanged. Physical newlines remain line breaks. Continuation
+rows start with `↪ `, with the space omitted in very narrow terminals. Use
+`--no-wrap-marker-space` for the compact `↪` prefix, or `--no-wordwrap` for wrapping
+at any character. These flags control wrapping style; `-S` disables wrapping.
+
+For tabular output, `pager --header=1 table.txt` keeps the first line visible while
+scrolling. `pager --header=1,8 table.txt` also keeps the first eight display columns
+fixed when scrolling horizontally. `--header=2,0,3` uses lines 3 and 4 as the header;
+lines before the header are hidden. Header columns do not include the line-number
+gutter.
+When scrolling separates the header from the following input line, its last row
+is underlined across the text area to show that it is floating. The underline
+disappears when the body returns to the line immediately after the header.
+
+Like `less`, active headers truncate long lines and allow horizontal scrolling,
+regardless of the wrap setting. Use `--header=-` or `:header -` to disable headers
+and restore the wrap setting. Empty or omitted L/C fields keep their previous
+values, so `--header=,8` sets only the fixed columns. Header rows are limited to
+the available height, leaving at least one row for the body.
 
 ## Keybindings
 
@@ -95,6 +127,8 @@ command | pager
 | `:sync` | Enable synchronized output rendering |
 | `:nosync` | Disable synchronized output rendering |
 | `:filter <pattern>` | Filter lines by regex (empty pattern clears filter) |
+| `:header L[,C[,N]]` | Set fixed header lines/columns (N defaults to the top displayed line) |
+| `:header -` | Disable fixed headers |
 | `:n` | Next file |
 | `:p` | Previous file |
 | `:follow` | Enter follow mode |

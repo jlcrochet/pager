@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <locale.h>
 #include <poll.h>
 #include <regex.h>
 #include <signal.h>
@@ -17,6 +18,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <wctype.h>
 
 #include "lib/esc.h"
 #include "lib/keys.h"
@@ -108,6 +110,7 @@ static int read_key(void);
 static bool str_eq_ci(const char *a, const char *b);
 static void render_status_bar(void);
 static size_t rendered_rows_for_line(const char *line, size_t len);
+static size_t wrap_prefix_cols(void);
 static bool view_line_screen_span(size_t target_view_idx, size_t *out_row_start, size_t *out_rows_visible);
 
 struct sgr_state {
@@ -180,10 +183,13 @@ static int gutter_width = 0;
 
 static size_t scroll_line = 0;
 static size_t scroll_col = 0;
+static size_t header_lines = 0;
+static size_t header_cols = 0;
+static size_t header_start = 0;
 
 static bool wrap_mode = true;
 static bool word_wrap = true;
-static bool wrap_marker_space = false;
+static bool wrap_marker_space = true;
 static bool show_line_numbers = false;
 static bool follow_mode = false;
 static bool search_use_regex = true;
@@ -225,6 +231,7 @@ static const struct command_desc commands[] = {
 	{ "sync", "Enable sync rendering" },
 	{ "nosync", "Disable sync rendering" },
 	{ "filter", "Filter lines by regex" },
+	{ "header", "Set fixed lines/columns" },
 	{ "n", "Next file" },
 	{ "p", "Previous file" },
 	{ "follow", "Enter follow mode" },
@@ -287,6 +294,85 @@ static size_t digits_u(size_t value)
 		d++;
 	}
 	return d;
+}
+
+static bool header_active(void)
+{
+	return header_lines > 0 || header_cols > 0;
+}
+
+static bool lines_wrap(void)
+{
+	return wrap_mode && !header_active();
+}
+
+/* Empty L/C fields preserve their values; N defaults to the supplied line. */
+static bool set_header(const char *spec, size_t default_start)
+{
+	if (!spec)
+		return false;
+	if (strcmp(spec, "-") == 0) {
+		header_lines = header_cols = header_start = 0;
+		return true;
+	}
+
+	size_t values[] = { header_lines, header_cols, default_start + 1 };
+	const char *p = spec;
+	for (size_t field = 0; field < 3; field++) {
+		if (*p != ',' && *p != '\0') {
+			size_t value = 0;
+			do {
+				if (*p < '0' || *p > '9')
+					return false;
+				size_t digit = (size_t)(*p++ - '0');
+				if (value > (SIZE_MAX - digit) / 10)
+					return false;
+				value = value * 10 + digit;
+			} while (*p != ',' && *p != '\0');
+			values[field] = value;
+		}
+		if (*p == '\0')
+			break;
+		if (field == 2)
+			return false;
+		p++;
+	}
+	if (values[2] == 0)
+		return false;
+	header_lines = values[0];
+	header_cols = values[1];
+	header_start = values[2] - 1;
+	return true;
+}
+
+static size_t header_end(void)
+{
+	if (header_lines == 0)
+		return 0;
+	if (header_start >= line_count)
+		return line_count;
+	size_t available = line_count - header_start;
+	return header_start + (header_lines < available ? header_lines : available);
+}
+
+static bool is_header_line(size_t raw_line)
+{
+	return header_lines > 0 && raw_line >= header_start && raw_line < header_end();
+}
+
+static size_t header_screen_rows(void)
+{
+	if (header_lines == 0 || header_start >= line_count)
+		return 0;
+	size_t rows = header_end() - header_start;
+	/* Leave space for scrolling and the prompt, even in a tiny terminal. */
+	size_t max_rows = content_rows > 1 ? (size_t)content_rows - 1 : 0;
+	return rows < max_rows ? rows : max_rows;
+}
+
+static size_t body_screen_rows(void)
+{
+	return (size_t)content_rows - header_screen_rows();
 }
 
 static char *trim_left(char *s)
@@ -1856,7 +1942,8 @@ static size_t byte_offset_at_display_col(
 	size_t len,
 	size_t target_col,
 	struct sgr_state *state,
-	size_t *plain_pos_out)
+	size_t *plain_pos_out,
+	size_t *actual_col_out)
 {
 	size_t pos = 0;
 	size_t col = 0;
@@ -1887,6 +1974,8 @@ static size_t byte_offset_at_display_col(
 
 	if (plain_pos_out)
 		*plain_pos_out = plain_pos;
+	if (actual_col_out)
+		*actual_col_out = col;
 
 	return pos;
 }
@@ -1896,6 +1985,47 @@ struct wrap_slice {
 	size_t advance_cols;
 };
 
+/* Use a UTF-8 character locale without changing regex or config parsing. */
+static bool wrap_word_char(uint32_t cp)
+{
+	if (cp < 128)
+		return isalnum((unsigned char)cp) || cp == '_';
+	static locale_t utf8_locale;
+	static bool locale_initialized;
+	if (!locale_initialized) {
+		utf8_locale = newlocale(LC_CTYPE_MASK, "C.UTF-8", (locale_t)0);
+		locale_initialized = true;
+	}
+	return utf8_locale && iswalnum_l((wint_t)cp, utf8_locale);
+}
+
+static bool wrap_space_char(uint32_t cp)
+{
+	return (cp < 128 && isspace((unsigned char)cp))
+		|| cp == 0x85 || cp == 0xa0 || cp == 0x1680
+		|| (cp >= 0x2000 && cp <= 0x200a)
+		|| cp == 0x2028 || cp == 0x2029 || cp == 0x202f
+		|| cp == 0x205f || cp == 0x3000;
+}
+
+/* Only look ahead far enough to decide whether the remaining word fits. */
+static bool wrap_word_fits(
+	const char *line, size_t len, size_t pos, size_t col,
+	size_t word_start, size_t capacity, bool little)
+{
+	while (col - word_start <= capacity && pos < len) {
+		struct display_token token = next_display_token(line, len, pos, col);
+		if (!token.ansi) {
+			uint32_t cp = utf8_decode((const unsigned char *)line + pos, len - pos, NULL);
+			if (little ? !wrap_word_char(cp) : wrap_space_char(cp))
+				return true;
+			col += token.width;
+		}
+		pos += token.bytes;
+	}
+	return col - word_start <= capacity;
+}
+
 static struct wrap_slice wrapped_slice(
 	const char *line,
 	size_t len,
@@ -1903,67 +2033,68 @@ static struct wrap_slice wrapped_slice(
 	size_t max_cols)
 {
 	struct wrap_slice slice = { 0, 0 };
-	size_t pos = byte_offset_at_display_col(line, len, start_col, NULL, NULL);
-	size_t logical_col = start_col;
-	size_t last_break_cols = 0;
+	size_t pos = byte_offset_at_display_col(line, len, start_col, NULL, NULL, NULL);
+	size_t col = start_col;
+	size_t big_break = 0, little_break = 0;
+	bool saw_text = false;
 
-	while (pos < len && slice.render_cols < max_cols) {
-		struct display_token token = next_display_token(line, len, pos, logical_col);
-		if (token.bytes == 0)
-			break;
-
-		if (token.ansi) {
-			pos += token.bytes;
-			continue;
+	while (pos < len) {
+		struct display_token token = next_display_token(line, len, pos, col);
+		if (!token.ansi) {
+			if (token.width > max_cols - slice.render_cols)
+				break;
+			uint32_t cp = utf8_decode((const unsigned char *)line + pos, len - pos, NULL);
+			col += token.width;
+			slice.render_cols += token.width;
+			if (wrap_space_char(cp))
+				big_break = slice.render_cols;
+			else
+				saw_text = true;
+			if (!wrap_word_char(cp))
+				little_break = slice.render_cols;
 		}
-
-		if (token.width > max_cols - slice.render_cols)
-			break;
-
-		bool break_space = line[pos] == ' ' || token.tab;
 		pos += token.bytes;
-		logical_col += token.width;
-		slice.render_cols += token.width;
-		if (break_space)
-			last_break_cols = slice.render_cols;
 	}
 
 	slice.advance_cols = slice.render_cols;
-	if (!word_wrap || pos >= len)
+	if (pos >= len)
 		return slice;
 
-	if (slice.render_cols == max_cols) {
-		size_t look_pos = pos;
-		bool has_next_visible = false;
-		while (look_pos < len) {
-			struct display_token token = next_display_token(
-				line, len, look_pos, start_col + slice.render_cols);
-			if (token.bytes == 0)
-				break;
-			if (token.ansi || token.width == 0) {
-				look_pos += token.bytes;
-				continue;
+	if (word_wrap) {
+		/* Attach all trailing whitespace, clipping only its visible portion. */
+		uint32_t cp = utf8_decode((const unsigned char *)line + pos, len - pos, NULL);
+		if (saw_text && wrap_space_char(cp)) {
+			while (pos < len) {
+				struct display_token token = next_display_token(line, len, pos, col);
+				if (!token.ansi) {
+					cp = utf8_decode((const unsigned char *)line + pos, len - pos, NULL);
+					if (!wrap_space_char(cp))
+						break;
+					col += token.width;
+				}
+				pos += token.bytes;
 			}
-			has_next_visible = true;
-			if (line[look_pos] == ' ' || token.tab)
-				slice.advance_cols += token.width;
-			break;
+			slice.advance_cols = col - start_col;
+			slice.render_cols = slice.advance_cols < max_cols ? slice.advance_cols : max_cols;
+			return slice;
 		}
-		if (!has_next_visible)
-			return slice;
-		if (slice.advance_cols > slice.render_cols)
-			return slice;
+
+		size_t prefix = wrap_prefix_cols();
+		size_t next_cols = (size_t)content_cols > prefix ? (size_t)content_cols - prefix : 1;
+		if (big_break > 0 && wrap_word_fits(
+			line, len, pos, col, start_col + big_break, next_cols, false)) {
+			slice.render_cols = slice.advance_cols = big_break;
+		} else if (little_break > 0 && wrap_word_fits(
+			line, len, pos, col, start_col + little_break, next_cols, true)) {
+			slice.render_cols = slice.advance_cols = little_break;
+		}
 	}
 
-	if (last_break_cols > 0) {
-		slice.render_cols = last_break_cols;
-		slice.advance_cols = last_break_cols;
-		return slice;
-	}
-
-	if (slice.render_cols == 0 && pos < len) {
+	/* A tab or wide character may exceed even an empty row: still advance. */
+	if (slice.advance_cols == 0) {
+		struct display_token token = next_display_token(line, len, pos, col);
 		slice.render_cols = max_cols;
-		slice.advance_cols = max_cols;
+		slice.advance_cols = token.width;
 	}
 	return slice;
 }
@@ -2317,25 +2448,43 @@ static bool compile_regex_with_case(
 	return true;
 }
 
+static size_t view_start_index(void)
+{
+	size_t first = header_end();
+	if (!filter_active || first == 0)
+		return first;
+	size_t lo = 0, hi = filtered_count;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (filtered_lines[mid] < first)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
 static size_t view_line_count(void)
 {
-	return filter_active ? filtered_count : line_count;
+	return (filter_active ? filtered_count : line_count) - view_start_index();
 }
 
 static size_t view_to_raw_line(size_t view_idx)
 {
 	if (filter_active)
-		return filtered_lines[view_idx];
-	return view_idx;
+		return filtered_lines[view_start_index() + view_idx];
+	return view_start_index() + view_idx;
 }
 
 static bool raw_to_view_line(size_t raw_line, size_t *view_idx)
 {
+	if (raw_line < header_end())
+		return false;
 	if (!filter_active) {
 		if (raw_line >= line_count)
 			return false;
 		if (view_idx)
-			*view_idx = raw_line;
+			*view_idx = raw_line - view_start_index();
 		return true;
 	}
 
@@ -2345,7 +2494,7 @@ static bool raw_to_view_line(size_t raw_line, size_t *view_idx)
 		size_t mid = lo + (hi - lo) / 2;
 		if (filtered_lines[mid] == raw_line) {
 			if (view_idx)
-				*view_idx = mid;
+				*view_idx = mid - view_start_index();
 			return true;
 		}
 		if (filtered_lines[mid] < raw_line)
@@ -2359,12 +2508,13 @@ static bool raw_to_view_line(size_t raw_line, size_t *view_idx)
 static size_t max_scroll_line(void)
 {
 	size_t count = view_line_count();
-	if (!wrap_mode)
-		return count > (size_t)content_rows ? count - (size_t)content_rows : 0;
+	size_t body_rows = body_screen_rows();
+	if (!lines_wrap())
+		return count > body_rows ? count - body_rows : 0;
 
 	/* Fill the last page using screen rows, including wrapped continuations. */
 	size_t first = count;
-	size_t remaining = (size_t)content_rows;
+	size_t remaining = body_rows;
 	while (first > 0) {
 		size_t len = 0;
 		const char *line = get_line(view_to_raw_line(first - 1), &len);
@@ -2385,7 +2535,8 @@ static void clamp_scroll(void)
 	size_t count = view_line_count();
 	if (count == 0) {
 		scroll_line = 0;
-		scroll_col = 0;
+		if (!header_active())
+			scroll_col = 0;
 		return;
 	}
 
@@ -2394,7 +2545,7 @@ static void clamp_scroll(void)
 	if (scroll_line > max_scroll)
 		scroll_line = max_scroll;
 
-	if (wrap_mode)
+	if (lines_wrap())
 		scroll_col = 0;
 }
 
@@ -2484,6 +2635,8 @@ static void ensure_match_visible(size_t match_idx)
 {
 	if (match_idx >= match_count)
 		return;
+	if (is_header_line(matches[match_idx].line_idx))
+		return;
 
 	size_t view_idx = 0;
 	if (!raw_to_view_line(matches[match_idx].line_idx, &view_idx))
@@ -2523,12 +2676,14 @@ static void find_all_matches(const char *pattern, bool preserve_current_line)
 		search_regex_valid = true;
 	}
 
-	size_t view_count = view_line_count();
+	size_t fixed_count = header_lines > 0 && header_start < line_count
+		? header_end() - header_start : 0;
+	size_t search_count = fixed_count + view_line_count();
 	char *plain = NULL;
 	size_t plain_cap = 0;
 
-	for (size_t i = 0; i < view_count; i++) {
-		size_t raw_line = view_to_raw_line(i);
+	for (size_t i = 0; i < search_count; i++) {
+		size_t raw_line = i < fixed_count ? header_start + i : view_to_raw_line(i - fixed_count);
 		size_t len = 0;
 		const char *line = get_line(raw_line, &len);
 
@@ -2808,6 +2963,13 @@ static bool apply_filter(const char *pattern, bool quiet)
 	return true;
 }
 
+static bool header_row_floats(size_t raw_line)
+{
+	size_t rows = header_screen_rows();
+	return rows > 0 && raw_line == header_start + rows - 1
+		&& view_line_count() > 0 && view_to_raw_line(scroll_line) > raw_line + 1;
+}
+
 static void draw_gutter(size_t raw_line, bool continuation)
 {
 	if (!show_line_numbers)
@@ -2840,17 +3002,22 @@ static size_t wrap_prefix_cols(void)
 
 static void draw_wrap_prefix(void)
 {
+	if (wrap_prefix_cols() == 0)
+		return;
 	PUTS_ERR(SGR_HALF_BRIGHT_ON WRAP_CONT_MARK);
 	if (wrap_marker_space && content_cols > 2)
 		PUTC_ERR(' ');
 	PUTS_ERR(SGR_RESET);
 }
 
-static size_t render_line_slice(const char *line, size_t len, size_t start_col, size_t max_cols, size_t raw_line)
+static size_t render_line_slice(
+	const char *line, size_t len, size_t start_col, size_t max_cols, size_t raw_line,
+	bool underline)
 {
 	struct sgr_state sgr;
 	size_t plain_pos = 0;
-	size_t pos = byte_offset_at_display_col(line, len, start_col, &sgr, &plain_pos);
+	size_t logical_col = 0;
+	size_t pos = byte_offset_at_display_col(line, len, start_col, &sgr, &plain_pos, &logical_col);
 
 	emit_sgr_state(&sgr);
 
@@ -2866,7 +3033,6 @@ static size_t render_line_slice(const char *line, size_t len, size_t start_col, 
 	while (match_idx < line_matches && matches[line_first + match_idx].end <= plain_pos)
 		match_idx++;
 
-	size_t logical_col = start_col;
 	size_t out_cols = 0;
 	bool highlight_on = false;
 	bool current_highlight = false;
@@ -2883,8 +3049,13 @@ static size_t render_line_slice(const char *line, size_t len, size_t start_col, 
 			continue;
 		}
 
-		if (token.width > max_cols - out_cols)
-			break;
+		size_t skip_cols = start_col > logical_col ? start_col - logical_col : 0;
+		if (skip_cols > token.width)
+			skip_cols = token.width;
+		size_t visible_cols = token.width - skip_cols;
+		bool partial = skip_cols > 0 || visible_cols > max_cols - out_cols;
+		if (visible_cols > max_cols - out_cols)
+			visible_cols = max_cols - out_cols;
 
 		while (match_idx < line_matches && matches[line_first + match_idx].end <= plain_pos)
 			match_idx++;
@@ -2914,8 +3085,11 @@ static size_t render_line_slice(const char *line, size_t len, size_t start_col, 
 			current_highlight = should_current;
 		}
 
-		if (token.tab) {
-			for (size_t i = 0; i < token.width; i++)
+		/* Input SGR resets and search styles must not erase the header boundary. */
+		if (underline)
+			PUTS_ERR(SGR_UNDERSCORE_ON);
+		if (token.tab || partial) {
+			for (size_t i = 0; i < visible_cols; i++)
 				PUTC_ERR(' ');
 		} else {
 			WRITE_ERR(line + pos, token.bytes);
@@ -2924,7 +3098,7 @@ static size_t render_line_slice(const char *line, size_t len, size_t start_col, 
 		pos += token.bytes;
 		plain_pos += token.plain_bytes;
 		logical_col += token.width;
-		out_cols += token.width;
+		out_cols += visible_cols;
 	}
 
 	if (highlight_on) {
@@ -2942,9 +3116,37 @@ static void finish_line_slice(size_t rendered_cols, size_t max_cols)
 		PUTS_ERR(ERASE_TO_EOL);
 }
 
+static void draw_unwrapped_line(size_t raw_line)
+{
+	size_t len = 0;
+	const char *line = get_line(raw_line, &len);
+	draw_gutter(raw_line, false);
+	bool underline = header_row_floats(raw_line);
+	size_t cols = (size_t)content_cols;
+	size_t fixed = header_cols < cols ? header_cols : cols;
+	if (fixed > 0) {
+		size_t rendered = render_line_slice(line, len, 0, fixed, raw_line, underline);
+		PUTS_ERR(SGR_RESET);
+		if (underline)
+			PUTS_ERR(SGR_UNDERSCORE_ON);
+		for (size_t i = rendered; i < fixed; i++)
+			PUTC_ERR(' ');
+	}
+	size_t start = scroll_col > SIZE_MAX - fixed ? SIZE_MAX : fixed + scroll_col;
+	size_t rendered = render_line_slice(line, len, start, cols - fixed, raw_line, underline);
+	if (underline) {
+		PUTS_ERR(SGR_RESET SGR_UNDERSCORE_ON);
+		for (size_t i = rendered; i < cols - fixed; i++)
+			PUTC_ERR(' ');
+		PUTS_ERR(SGR_RESET);
+	} else {
+		finish_line_slice(rendered, cols - fixed);
+	}
+}
+
 static size_t rendered_rows_for_line(const char *line, size_t len)
 {
-	if (!wrap_mode)
+	if (!lines_wrap())
 		return 1;
 
 	size_t width = display_width(line, len);
@@ -2974,7 +3176,7 @@ static bool view_line_screen_span(size_t target_view_idx, size_t *out_row_start,
 	if (target_view_idx < scroll_line)
 		return false;
 
-	size_t row = 0;
+	size_t row = header_screen_rows();
 	size_t total = view_line_count();
 	for (size_t view_idx = scroll_line; view_idx < total && row < (size_t)content_rows; view_idx++) {
 		size_t raw_line = view_to_raw_line(view_idx);
@@ -3012,12 +3214,9 @@ static void redraw_visible_view_line(size_t view_idx)
 	size_t line_len = 0;
 	const char *line = get_line(raw_line, &line_len);
 
-	if (!wrap_mode) {
+	if (!lines_wrap()) {
 		PRINTF_ERR(CUP(%zu, 1), row_start + 1);
-		draw_gutter(raw_line, false);
-		size_t rendered_cols = render_line_slice(
-			line, line_len, scroll_col, (size_t)content_cols, raw_line);
-		finish_line_slice(rendered_cols, (size_t)content_cols);
+		draw_unwrapped_line(raw_line);
 		return;
 	}
 
@@ -3037,7 +3236,7 @@ static void redraw_visible_view_line(size_t view_idx)
 
 		struct wrap_slice slice = wrapped_slice(line, line_len, start_col, line_cols);
 		size_t rendered_cols = render_line_slice(
-			line, line_len, start_col, slice.render_cols, raw_line);
+			line, line_len, start_col, slice.render_cols, raw_line, false);
 		finish_line_slice(rendered_cols, line_cols);
 
 		start_col += slice.advance_cols;
@@ -3054,6 +3253,8 @@ static bool redraw_search_transition_if_possible(size_t old_match_idx)
 
 	size_t old_raw = matches[old_match_idx].line_idx;
 	size_t new_raw = matches[current_match].line_idx;
+	if (is_header_line(old_raw) || is_header_line(new_raw))
+		return false;
 	size_t old_view = 0;
 	size_t new_view = 0;
 	bool old_visible = raw_to_view_line(old_raw, &old_view);
@@ -3080,7 +3281,7 @@ static void render_status_bar(void)
 	size_t total = view_line_count();
 	size_t top = total > 0 ? scroll_line + 1 : 0;
 	size_t bottom = scroll_line;
-	size_t remaining = (size_t)content_rows;
+	size_t remaining = body_screen_rows();
 	while (bottom < total && remaining > 0) {
 		size_t len = 0;
 		const char *line = get_line(view_to_raw_line(bottom), &len);
@@ -3089,6 +3290,16 @@ static void render_status_bar(void)
 		if (rows >= remaining)
 			break;
 		remaining -= rows;
+	}
+	if (!filter_active && header_lines > 0) {
+		if (total > 0) {
+			top += header_end();
+			bottom += header_end();
+		} else if (header_screen_rows() > 0) {
+			top = header_start + 1;
+			bottom = header_start + header_screen_rows();
+		}
+		total = line_count;
 	}
 
 	char source[512];
@@ -3103,10 +3314,11 @@ static void render_status_bar(void)
 	}
 
 	char flags[128];
-	snprintf(flags, sizeof(flags), "%s %s%s",
-		wrap_mode ? "WRAP" : "NOWRAP",
+	snprintf(flags, sizeof(flags), "%s %s%s%s",
+		lines_wrap() ? "WRAP" : "NOWRAP",
 		follow_mode ? "FOLLOW" : "VIEW",
-		filter_active ? " FILTER" : "");
+		filter_active ? " FILTER" : "",
+		header_active() ? " HEADER" : "");
 
 	char right[256];
 	snprintf(right, sizeof(right), "%zu-%zu/%zu  %s", top, bottom, total, flags);
@@ -3162,6 +3374,12 @@ static void render_frame(bool include_status_bar)
 
 	size_t view_idx = scroll_line;
 	int row = 1;
+	size_t fixed_rows = header_screen_rows();
+	for (size_t i = 0; i < fixed_rows; i++) {
+		draw_unwrapped_line(header_start + i);
+		PUTC_ERR('\n');
+		row++;
+	}
 
 	while (row <= content_rows) {
 		if (view_idx >= view_line_count()) {
@@ -3180,7 +3398,7 @@ static void render_frame(bool include_status_bar)
 		size_t len = 0;
 		const char *line = get_line(raw_line, &len);
 
-		if (wrap_mode) {
+		if (lines_wrap()) {
 			size_t width = display_width(line, len);
 			if (width == 0) {
 				draw_gutter(raw_line, false);
@@ -3209,7 +3427,7 @@ static void render_frame(bool include_status_bar)
 
 					struct wrap_slice slice = wrapped_slice(line, len, start_col, line_cols);
 					size_t rendered_cols = render_line_slice(
-						line, len, start_col, slice.render_cols, raw_line);
+						line, len, start_col, slice.render_cols, raw_line, false);
 
 					finish_line_slice(rendered_cols, line_cols);
 					if (row < content_rows)
@@ -3221,10 +3439,7 @@ static void render_frame(bool include_status_bar)
 				}
 			}
 		} else {
-			draw_gutter(raw_line, false);
-			size_t rendered_cols = render_line_slice(
-				line, len, scroll_col, (size_t)content_cols, raw_line);
-			finish_line_slice(rendered_cols, (size_t)content_cols);
+			draw_unwrapped_line(raw_line);
 			if (row < content_rows)
 				PUTC_ERR('\n');
 			row++;
@@ -3555,8 +3770,10 @@ static bool go_to_line(size_t one_based)
 		raw_line = line_count - 1;
 
 	size_t view_idx = 0;
+	if (is_header_line(raw_line))
+		return true;
 	if (!raw_to_view_line(raw_line, &view_idx)) {
-		set_flash("Line hidden by filter");
+		set_flash(raw_line < header_end() ? "Line hidden by header" : "Line hidden by filter");
 		return false;
 	}
 
@@ -3596,7 +3813,7 @@ static void show_help_screen(void)
 		"  y                 yank current line to clipboard\n"
 		"\n"
 		"Commands: :q :123 :wrap :nowrap :number :nonumber :sync :nosync\n"
-		"          :filter <pattern> :n :p :follow :help\n"
+		"          :filter <pattern> :header L[,C[,N]] :header - :n :p :follow :help\n"
 		"Config:   [keybindings]\n"
 		"\n"
 		"Press any key to return..."
@@ -4169,7 +4386,8 @@ static bool execute_command_line(const char *input)
 
 	if (strcmp(cmd, "wrap") == 0) {
 		wrap_mode = true;
-		scroll_col = 0;
+		if (lines_wrap())
+			scroll_col = 0;
 		return true;
 	}
 
@@ -4220,6 +4438,24 @@ static bool execute_command_line(const char *input)
 
 	if (strcmp(cmd, "help") == 0) {
 		show_help_screen();
+		return true;
+	}
+
+	if (strncmp(cmd, "header", 6) == 0 && (cmd[6] == '=' || isspace((unsigned char)cmd[6]))) {
+		const char *spec = cmd + 7;
+		while (isspace((unsigned char)*spec))
+			spec++;
+		size_t anchor = view_line_count() > 0 ? view_to_raw_line(scroll_line) : 0;
+		size_t start_line = header_screen_rows() > 0 ? header_start : anchor;
+		if (!set_header(spec, start_line)) {
+			set_flash("Invalid header: use L[,C[,N]] or -");
+			return true;
+		}
+		if (!raw_to_view_line(anchor, &scroll_line))
+			scroll_line = 0;
+		clamp_scroll();
+		if (search_query[0] != '\0')
+			find_all_matches(search_query, true);
 		return true;
 	}
 
@@ -4502,10 +4738,11 @@ static void open_search_prompt(bool backward)
 static bool handle_navigation_action(enum pager_action action)
 {
 	size_t count = view_line_count();
-	if (count == 0)
+	if (count == 0 && action != ACTION_SCROLL_LEFT && action != ACTION_SCROLL_RIGHT)
 		return false;
 
-	size_t half_page = (size_t)content_rows / 2;
+	size_t page_rows = body_screen_rows();
+	size_t half_page = page_rows / 2;
 	if (half_page == 0)
 		half_page = 1;
 
@@ -4524,12 +4761,12 @@ static bool handle_navigation_action(enum pager_action action)
 			break;
 
 		case ACTION_PAGE_DOWN:
-			scroll_line += (size_t)content_rows;
+			scroll_line += page_rows;
 			break;
 
 		case ACTION_PAGE_UP:
-			if (scroll_line > (size_t)content_rows)
-				scroll_line -= (size_t)content_rows;
+			if (scroll_line > page_rows)
+				scroll_line -= page_rows;
 			else
 				scroll_line = 0;
 			break;
@@ -4554,12 +4791,12 @@ static bool handle_navigation_action(enum pager_action action)
 			break;
 
 		case ACTION_SCROLL_LEFT:
-			if (!wrap_mode && scroll_col > 0)
+			if (!lines_wrap() && scroll_col > 0)
 				scroll_col--;
 			break;
 
 		case ACTION_SCROLL_RIGHT:
-			if (!wrap_mode)
+			if (!lines_wrap() && scroll_col < SIZE_MAX)
 				scroll_col++;
 			break;
 
@@ -4624,7 +4861,7 @@ static bool handle_key(int key)
 
 		case ACTION_TOGGLE_WRAP:
 			wrap_mode = !wrap_mode;
-			if (wrap_mode)
+			if (lines_wrap())
 				scroll_col = 0;
 			clamp_scroll();
 			return true;
@@ -4904,12 +5141,17 @@ static void print_usage(FILE *stream)
 		"  -N, --number      Show line numbers\n"
 		"  -S, --nowrap      Start in horizontal scroll mode\n"
 		"  -F, --follow      Start in follow mode\n"
-		"      --wordwrap    Wrap lines at spaces and tabs (default)\n"
+		"      --wordwrap    Prefer whole words, then word parts (default)\n"
 		"      --no-wordwrap Wrap lines at any character\n"
 		"      --wrap-marker-space\n"
-		"                    Add a space after the wrapped-line marker\n"
+		"                    Add a space after the wrapped-line marker (default)\n"
+		"      --no-wrap-marker-space\n"
+		"                    Omit the space after the wrapped-line marker\n"
 		"      --quit-if-one-screen\n"
 		"                    Quit after printing if one input fits one terminal page\n"
+		"      --header L[,C[,N]]\n"
+		"                    Keep L lines and C columns fixed, starting at line N (default 1)\n"
+		"                    Truncate long lines while active; --header=- disables headers\n"
 		"  -l, --line N      Start at line N\n"
 		"  -p, --pattern P   Start with search pattern\n"
 		"      --sync-output Enable synchronized output rendering\n"
@@ -4945,8 +5187,10 @@ int main(int argc, char **argv)
 		OPT_NO_SYNC_OUTPUT,
 		OPT_QUIT_IF_ONE_SCREEN,
 		OPT_WRAP_MARKER_SPACE,
+		OPT_NO_WRAP_MARKER_SPACE,
 		OPT_WORDWRAP,
 		OPT_NO_WORDWRAP,
+		OPT_HEADER,
 	};
 
 	struct option options[] = {
@@ -4956,7 +5200,9 @@ int main(int argc, char **argv)
 		{ "wordwrap", no_argument, 0, OPT_WORDWRAP },
 		{ "no-wordwrap", no_argument, 0, OPT_NO_WORDWRAP },
 		{ "wrap-marker-space", no_argument, 0, OPT_WRAP_MARKER_SPACE },
+		{ "no-wrap-marker-space", no_argument, 0, OPT_NO_WRAP_MARKER_SPACE },
 		{ "quit-if-one-screen", no_argument, 0, OPT_QUIT_IF_ONE_SCREEN },
+		{ "header", required_argument, 0, OPT_HEADER },
 		{ "line", required_argument, 0, 'l' },
 		{ "pattern", required_argument, 0, 'p' },
 		{ "sync-output", no_argument, 0, OPT_SYNC_OUTPUT },
@@ -4995,8 +5241,17 @@ int main(int argc, char **argv)
 			case OPT_WRAP_MARKER_SPACE:
 				wrap_marker_space = true;
 				break;
+			case OPT_NO_WRAP_MARKER_SPACE:
+				wrap_marker_space = false;
+				break;
 			case OPT_QUIT_IF_ONE_SCREEN:
 				quit_if_one_screen = true;
+				break;
+			case OPT_HEADER:
+				if (!set_header(optarg, 0)) {
+					fprintf(stderr, "Invalid header: %s (use L[,C[,N]] or -)\n", optarg);
+					return EXIT_FAILURE;
+				}
 				break;
 			case 'l': {
 				if (!parse_toml_size(optarg, &start_line)) {
@@ -5088,6 +5343,7 @@ int main(int argc, char **argv)
 		return EXIT_SUCCESS;
 	}
 
+	update_term_size();
 	if (start_line > 0)
 		go_to_line(start_line);
 
